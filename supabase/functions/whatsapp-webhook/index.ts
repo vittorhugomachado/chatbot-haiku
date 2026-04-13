@@ -771,15 +771,31 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "jsr:@supabase/supabase-js@2"
 
 const VERIFY_TOKEN = "virtual_barber_webhook_2026"
+const BARBERSHOP_TEST_ID = Deno.env.get("BARBERSHOP_TEST_ID") || ""
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 )
 
 // ============================================
+// CACHE DE DADOS DA BARBEARIA (carregado uma vez por worker)
+// ============================================
+let BARBERSHOP_NAME_CACHE: string | null = null
+
+async function getNomeBarbearia(): Promise<string> {
+  if (BARBERSHOP_NAME_CACHE) return BARBERSHOP_NAME_CACHE
+  const { data } = await supabase
+    .from("barbershops")
+    .select("name")
+    .eq("id", BARBERSHOP_TEST_ID)
+    .single()
+  BARBERSHOP_NAME_CACHE = data?.name || "Barbearia"
+  return BARBERSHOP_NAME_CACHE
+}
+
+// ============================================
 // DADOS MOCKADOS
 // ============================================
-const BARBERSHOP_NAME_MOCK = "Barbearia do Vitor"
 
 const SERVICOS_MOCK = [
   { id: "1", name: "✂️ Corte Tradicional", price: 35, duration: 30 },
@@ -838,7 +854,7 @@ const BARBEIROS_MOCK = [
 ]
 
 interface EstadoTeste {
-  etapa: 'inicio' | 'servico' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao'
+  etapa: 'inicio' | 'servico' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao' | 'informacoes' | 'listar_agendamentos'
   servico?: typeof SERVICOS_MOCK[0]
   dia?: string
   barbeiro?: typeof BARBEIROS_MOCK[0]
@@ -878,7 +894,8 @@ Deno.serve(async (req) => {
         return new Response("OK", { status: 200 })
       }
 
-      const nomeBarbearia = BARBERSHOP_NAME_MOCK
+      const nomeBarbearia = await getNomeBarbearia()
+
       const msg = value.messages[0] //OBJETO DA MENSAGEM DO CLIENTE
       const from = msg.from //NUMERO DO CLIENTE
       const phoneNumberId = value.metadata?.phone_number_id || value.phone_number_id //ID DO WHATSAPP DA BARBEARIA
@@ -908,11 +925,11 @@ Deno.serve(async (req) => {
       // 2. NÃO é uma interação (clique em botão)
       if (!estado.jaEnviouBoasVindas && !isInteractive) {
         console.log(`[ENVIO] Primeira interação - enviando botão`)
-        await enviarBotoesIniciais(phoneNumberId, BARBERSHOP_NAME_MOCK, from, nomeCliente)
+        await enviarBotoesIniciais(phoneNumberId, nomeBarbearia, from, nomeCliente)
         
         estado.jaEnviouBoasVindas = true
         estado.etapa = 'inicio'
-        await salvarEstadoConversa(from, estado)
+        await salvarEstadoConversa(from, estado, phoneNumberId)
         return new Response("OK", { status: 200 })
       }
 
@@ -923,10 +940,10 @@ Deno.serve(async (req) => {
       }
 
       // Processa resposta
-      const resposta = await processarComBotoes(texto, nomeCliente, estado)
+      const resposta = await processarComBotoes(texto, nomeCliente, estado, phoneNumberId, from)
 
       // Salva estado atualizado
-      await salvarEstadoConversa(from, estado)
+      await salvarEstadoConversa(from, estado, phoneNumberId)
 
       // Envia resposta se houver
       if (resposta) {
@@ -968,7 +985,7 @@ async function buscarEstadoConversa(clienteNumero: string): Promise<EstadoTeste>
   return { etapa: 'inicio', paginaBarbeiros: 1, jaEnviouBoasVindas: false }
 }
 
-async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste): Promise<void> {
+async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, phoneNumberId: string): Promise<void> {
   const { data: conversa } = await supabase
     .from("conversations_chatbot")
     .select("id, historic")
@@ -982,21 +999,23 @@ async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste):
     const historic = conversa.historic || []
     const outrosHistoricos = historic.filter((h: any) => h.tipo !== "estado_teste")
     const novoHistorico = [...outrosHistoricos, { role: "system", tipo: "estado_teste", content: estado }]
-    
-    await supabase
+
+    const { error } = await supabase
       .from("conversations_chatbot")
       .update({ historic: novoHistorico, updated_at: new Date().toISOString() })
       .eq("id", conversa.id)
+    if (error) console.error("[ERRO] salvarEstado update:", JSON.stringify(error))
   } else {
-    await supabase
+    const { error } = await supabase
       .from("conversations_chatbot")
       .insert({
-        barbershop_id: "teste",
-        barbershop_phone_number_id: "teste",
+        barbershop_id: BARBERSHOP_TEST_ID,
+        barbershop_phone_number_id: phoneNumberId,
         client_phone_number_id: clienteNumero,
         historic: [{ role: "system", tipo: "estado_teste", content: estado }],
         status: "em_andamento",
       })
+    if (error) console.error("[ERRO] salvarEstado insert:", JSON.stringify(error))
   }
 }
 
@@ -1006,8 +1025,10 @@ async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste):
 async function processarComBotoes(
   texto: string,
   nomeCliente: string,
-  estado: EstadoTeste
-): Promise<string> {
+  estado: EstadoTeste,
+  phoneNumberId: string,
+  from: string
+): Promise<string | null> {
   
   // CLIQUE NO BOTÃO AGENDAR
   if (texto === "acao_agendar") {
@@ -1049,25 +1070,30 @@ async function processarComBotoes(
         estado.etapa = 'servico'
         return enviarMenuServicos()
       }
-      return "Digite *AGENDAR* para começar!"
+      await enviarBotoesIniciais(phoneNumberId, BARBERSHOP_NAME_CACHE ?? "Barbearia", from, nomeCliente, "Pra gente seguir com teu agendamento é só clicar em uma das opções abaixo 😊")
+      return null
 
     case 'servico':
       const servico = SERVICOS_MOCK.find(s => s.id === texto || s.name.toLowerCase().includes(texto.toLowerCase()))
       if (servico) {
         estado.servico = servico
         estado.etapa = 'dia'
-        return enviarMenuDias()
+        await enviarBotoesData(phoneNumberId, from, nomeCliente)
+        return null
       }
       return "❓ Digite o NÚMERO do serviço (1 a 30) ou o NOME."
 
     case 'dia':
-      if (texto.toLowerCase() === "hoje" || texto.toLowerCase() === "amanha" || texto.match(/\d{2}\/\d{2}/)) {
-        estado.dia = texto.toLowerCase() === "hoje" ? "hoje" : texto.toLowerCase() === "amanha" ? "amanhã" : texto
+      if (texto === "dia_outra") {
+        return "📅 Digite a data desejada no formato *DD/MM* (ex: 20/04)"
+      }
+      if (texto === "dia_hoje" || texto === "dia_amanha" || texto.match(/^\d{2}\/\d{2}$/)) {
+        estado.dia = texto === "dia_hoje" ? "hoje" : texto === "dia_amanha" ? "amanhã" : texto
         estado.etapa = 'barbeiro'
         estado.paginaBarbeiros = 1
         return enviarListaBarbeiros(estado.paginaBarbeiros)
       }
-      return "❓ Escolha: *HOJE*, *AMANHÃ* ou uma data (ex: 15/04)"
+      return "❓ Escolha um dos dias disponíveis ou envie uma data (ex: 15/04)"
 
     case 'barbeiro':
       if (texto.toLowerCase() === "proximo") {
@@ -1201,7 +1227,44 @@ function mensagemConfirmacao(estado: EstadoTeste, nomeCliente: string): string {
 // ENVIOS WHATSAPP
 // ============================================
 
-async function enviarBotoesIniciais(phoneNumberId: string, nomeBarbearia: string, to: string, nomeCliente: string): Promise<void> {
+async function enviarBotoesIniciais(phoneNumberId: string, nomeBarbearia: string, to: string, nomeCliente: string, bodyText?: string): Promise<void> {
+  const token = Deno.env.get("WHATSAPP_TOKEN")
+  if (!token) return
+
+  const mensagem = bodyText ?? `👋 Olá ${nomeCliente}! Bem-vindo à ${nomeBarbearia}!\n\nO que você gostaria de fazer?`
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: mensagem },
+      action: {
+        buttons: [
+          { type: "reply", reply: { id: "acao_agendar", title: "📅 AGENDAR" } },
+          { type: "reply", reply: { id: "acao_meus_agendamentos", title: "📋 MEUS AGENDAMENTOS" } },
+          { type: "reply", reply: { id: "acao_informacoes", title: "ℹ️ INFORMAÇÕES" } }
+        ]
+      }
+    }
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    const result = await response.json()
+    if (result.error) console.error("[ERRO] botão:", JSON.stringify(result.error))
+    else console.log("[BOTÕES] Enviados com sucesso")
+  } catch (err) {
+    console.error("[ERRO] enviarBotoesIniciais:", err)
+  }
+}
+
+async function enviarBotoesData(phoneNumberId: string, to: string, nomeCliente: string): Promise<void> {
   const token = Deno.env.get("WHATSAPP_TOKEN")
   if (!token) return
 
@@ -1211,12 +1274,12 @@ async function enviarBotoesIniciais(phoneNumberId: string, nomeBarbearia: string
     type: "interactive",
     interactive: {
       type: "button",
-      body: { text: `👋 Olá ${nomeCliente}! Bem-vindo à ${nomeBarbearia}!\n\nO que você gostaria de fazer?` },
+      body: { text: `📅 Qual dia você quer agendar?` },
       action: {
         buttons: [
-          { type: "reply", reply: { id: "acao_agendar", title: "📅 AGENDAR" } },
-          { type: "reply", reply: { id: "acao_meus_agendamentos", title: "📋 MEUS AGENDAMENTOS" } },
-          { type: "reply", reply: { id: "acao_informacoes", title: "ℹ️ INFORMAÇÕES" } }
+          { type: "reply", reply: { id: "dia_hoje", title: "📅 Hoje" } },
+          { type: "reply", reply: { id: "dia_amanha", title: "📋 Amanhã" } },
+          { type: "reply", reply: { id: "dia_outra", title: "🗓️ Outra data" } }
         ]
       }
     }
