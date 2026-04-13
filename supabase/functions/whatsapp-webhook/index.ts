@@ -868,9 +868,6 @@ Deno.serve(async (req) => {
       const body = await req.json()
       const value = body.entry?.[0]?.changes?.[0]?.value
 
-      console.log("🟢 body:", JSON.stringify(body).substring(0, 500))
-      console.log("🟢 value:", JSON.stringify(value).substring(0, 500))
-
       //VERIFICA SE É SÓ STATUS (ex: mensagem entregue) — se for, ignora
       if (value?.statuses?.length > 0) {
         return new Response("OK", { status: 200 })
