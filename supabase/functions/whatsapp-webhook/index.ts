@@ -1,67 +1,850 @@
+// import "jsr:@supabase/functions-js/edge-runtime.d.ts"
+// import { createClient } from "jsr:@supabase/supabase-js@2"
+
+// // ============================================
+// // CONFIGURAÇÃO
+// // ============================================
+// const VERIFY_TOKEN = "virtual_barber_webhook_2026"
+// const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY") || ""
+// const BARBERSHOP_TEST_ID = Deno.env.get("BARBERSHOP_TEST_ID") || ""
+// const TEMPO_SESSAO_HORAS = 4
+// const INTERVALO_SLOT_MIN = 30   // slots sempre de 30 em 30 min
+// const MARGEM_FUTURO_MIN = 15    // ignora slots com menos de 15 min no futuro
+
+// const supabase = createClient(
+//   Deno.env.get("SUPABASE_URL")!,
+//   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+// )
+
+// // ============================================
+// // TIPOS
+// // ============================================
+// interface Servico {
+//   id: string
+//   name: string
+//   price: number
+//   duration_min: number
+// }
+
+// interface Barbeiro {
+//   id: string
+//   name: string
+//   description: string
+//   availability: Array<{
+//     day_of_week: number
+//     starts_at: string | null
+//     ends_at: string | null
+//     is_day_off: boolean
+//     use_custom_hours: boolean
+//   }>
+//   services: string[] // IDs dos serviços que realiza
+// }
+
+// interface OpeningHours {
+//   day_of_week: number
+//   opens_at: string
+//   closes_at: string
+//   is_open: boolean
+//   period_order: number
+// }
+
+// interface DadosBarbearia {
+//   barbershop_id: string
+//   barbershop_name: string
+//   phone: string
+//   address: string
+//   servicos: Servico[]
+//   barbeiros: Barbeiro[]
+//   opening_hours: OpeningHours[]
+// }
+
+// // ============================================
+// // SERVIDOR PRINCIPAL
+// // ============================================
+// Deno.serve(async (req) => {
+//   const url = new URL(req.url)
+
+//   if (req.method === "GET") {
+//     const mode = url.searchParams.get("hub.mode")
+//     const token = url.searchParams.get("hub.verify_token")
+//     const challenge = url.searchParams.get("hub.challenge")
+//     if (mode === "subscribe" && token === VERIFY_TOKEN) {
+//       return new Response(challenge, { status: 200 })
+//     }
+//     return new Response("Token invalido", { status: 403 })
+//   }
+
+//   if (req.method === "POST") {
+//     try {
+//       const body = await req.json()
+//       const value = body.entry?.[0]?.changes?.[0]?.value
+
+//       // Ignora status callbacks (sent, delivered, read)
+//       if (value?.statuses?.length > 0) {
+//         return new Response("OK", { status: 200 })
+//       }
+
+//       if (!value?.messages?.length) {
+//         return new Response("OK", { status: 200 })
+//       }
+
+//       const msg = value.messages[0]
+//       const from: string = msg.from
+//       const phoneNumberId: string = value.metadata?.phone_number_id || value.phone_number_id
+//       const nomeCliente: string = value.contacts?.[0]?.profile?.name || "Cliente"
+
+//       if (msg.type !== "text") {
+//         await enviarWhatsApp(phoneNumberId, from, "Desculpe, ainda não processo esse tipo de mensagem. Por favor, envie texto.")
+//         return new Response("OK", { status: 200 })
+//       }
+
+//       const texto = msg.text.body.trim()
+//       console.log(`[MSG] ${nomeCliente} (${from}): ${texto}`)
+
+//       // Sessão
+//       const { conversa, isNova } = await getOuCriarConversa(phoneNumberId, from)
+//       const historico: any[] = conversa.historic as any[]
+
+//       // Dados da barbearia (sempre fresh)
+//       const dados = await buscarDadosBarbearia()
+//       if (!dados) {
+//         await enviarWhatsApp(phoneNumberId, from, "Estamos com dificuldades técnicas. Tente novamente em instantes.")
+//         return new Response("OK", { status: 200 })
+//       }
+
+//       // Processa mensagem com Haiku
+//       const { resposta, novoStatus } = await processarMensagem(
+//         texto, nomeCliente, from, dados, historico, isNova
+//       )
+
+//       // Salva histórico (apenas user/assistant, máx 8 mensagens = 4 trocas)
+//       const mensagensAnteriores = historico
+//         .filter((h: any) => h.role === "user" || h.role === "assistant")
+//       const historicoFinal = [
+//         ...mensagensAnteriores,
+//         { role: "user", content: texto },
+//         { role: "assistant", content: resposta },
+//       ].slice(-8)
+
+//       await atualizarHistorico(conversa.id, historicoFinal, novoStatus)
+//       await enviarWhatsApp(phoneNumberId, from, resposta)
+//       console.log(`[RESP] → ${from}: ${resposta.substring(0, 100)}...`)
+
+//       return new Response("OK", { status: 200 })
+//     } catch (error) {
+//       console.error("[ERRO CRÍTICO]", error)
+//       return new Response("OK", { status: 200 })
+//     }
+//   }
+
+//   return new Response("Metodo nao suportado", { status: 405 })
+// })
+
+// // ============================================
+// // GESTÃO DE SESSÃO
+// // ============================================
+// async function getOuCriarConversa(
+//   phoneNumberId: string,
+//   clienteNumero: string
+// ): Promise<{ conversa: any; isNova: boolean }> {
+//   if (!BARBERSHOP_TEST_ID) throw new Error("BARBERSHOP_TEST_ID não configurado")
+
+//   const { data: existente } = await supabase
+//     .from("conversations_chatbot")
+//     .select("*")
+//     .eq("barbershop_id", BARBERSHOP_TEST_ID)
+//     .eq("client_phone_number_id", clienteNumero)
+//     .eq("status", "em_andamento")
+//     .order("updated_at", { ascending: false })
+//     .limit(1)
+//     .single()
+
+//   if (existente) {
+//     const diffHoras = (Date.now() - new Date(existente.updated_at).getTime()) / 3600000
+//     if (diffHoras < TEMPO_SESSAO_HORAS) {
+//       console.log(`[SESSÃO] Ativa (${diffHoras.toFixed(1)}h atrás)`)
+//       return { conversa: existente, isNova: false }
+//     }
+//     console.log(`[SESSÃO] Expirada (${diffHoras.toFixed(1)}h). Recriando...`)
+//     await supabase.from("conversations_chatbot").delete().eq("id", existente.id)
+//   }
+
+//   const { data: nova, error } = await supabase
+//     .from("conversations_chatbot")
+//     .insert({
+//       barbershop_id: BARBERSHOP_TEST_ID,
+//       barbershop_phone_number_id: phoneNumberId,
+//       client_phone_number_id: clienteNumero,
+//       historic: [],
+//       status: "em_andamento",
+//     })
+//     .select()
+//     .single()
+
+//   if (error || !nova) throw new Error("Não foi possível criar conversa")
+//   console.log(`[SESSÃO] Nova: ${nova.id}`)
+//   return { conversa: nova, isNova: true }
+// }
+
+// async function atualizarHistorico(conversaId: string, historico: any[], status: string): Promise<void> {
+//   const { error } = await supabase
+//     .from("conversations_chatbot")
+//     .update({ historic: historico, status, updated_at: new Date().toISOString() })
+//     .eq("id", conversaId)
+//   if (error) console.error("[ERRO] atualizarHistorico:", error)
+// }
+
+// // ============================================
+// // DADOS DA BARBEARIA
+// // ============================================
+// async function buscarDadosBarbearia(): Promise<DadosBarbearia | null> {
+//   const { data: barbearia } = await supabase
+//     .from("barbershops")
+//     .select("id, name, phone, addresses(city, neighborhood, street, number)")
+//     .eq("id", BARBERSHOP_TEST_ID)
+//     .single()
+
+//   if (!barbearia) {
+//     console.error("[ERRO] Barbearia não encontrada:", BARBERSHOP_TEST_ID)
+//     return null
+//   }
+
+//   const [{ data: servicos }, { data: barbeiros }, { data: openingHours }] = await Promise.all([
+//     supabase
+//       .from("services")
+//       .select("id, name, price, duration_min")
+//       .eq("barbershop_id", BARBERSHOP_TEST_ID)
+//       .eq("is_active", true)
+//       .order("name"),
+//     supabase
+//       .from("barbers")
+//       .select(`id, name, description,
+//         barber_availability(day_of_week, starts_at, ends_at, is_day_off, use_custom_hours),
+//         barber_services(service_id)`)
+//       .eq("barbershop_id", BARBERSHOP_TEST_ID)
+//       .eq("is_active", true),
+//     supabase
+//       .from("opening_hours")
+//       .select("day_of_week, opens_at, closes_at, is_open, period_order")
+//       .eq("barbershop_id", BARBERSHOP_TEST_ID)
+//       .order("day_of_week")
+//       .order("period_order"),
+//   ])
+
+//   const addr = barbearia.addresses?.[0]
+//   return {
+//     barbershop_id: barbearia.id,
+//     barbershop_name: barbearia.name,
+//     phone: barbearia.phone || "",
+//     address: addr ? `${addr.street}, ${addr.number} - ${addr.neighborhood}, ${addr.city}` : "",
+//     servicos: (servicos || []) as Servico[],
+//     barbeiros: (barbeiros || []).map((b: any) => ({
+//       id: b.id,
+//       name: b.name,
+//       description: b.description || "",
+//       availability: b.barber_availability || [],
+//       services: (b.barber_services || []).map((s: any) => s.service_id),
+//     })),
+//     opening_hours: (openingHours || []) as OpeningHours[],
+//   }
+// }
+
+// // Computa agenda dos próximos 7 dias com uma única query ao banco
+// async function computarAgendaSemana(dados: DadosBarbearia): Promise<string> {
+//   const hoje = new Date()
+//   const fimPeriodo = addDays(hoje, 8)
+
+//   // Uma query busca todos os agendamentos do período
+//   const { data: todosAgend, error: erroAgend } = await supabase
+//     .from("appointments")
+//     .select("barber_id, starts_at, ends_at")
+//     .eq("barbershop_id", dados.barbershop_id)
+//     .gte("starts_at", hoje.toISOString())
+//     .lte("starts_at", fimPeriodo.toISOString())
+//     .not("status", "in", "(cancelled_by_customer,cancelled_by_barbershop)")
+
+//   // Mapa: barber_id → lista de agendamentos
+//   const agendsPorBarbeiro: Record<string, Array<{ starts_at: string; ends_at: string }>> = {}
+//   for (const a of todosAgend || []) {
+//     if (a.barber_id) {
+//       if (!agendsPorBarbeiro[a.barber_id]) agendsPorBarbeiro[a.barber_id] = []
+//       agendsPorBarbeiro[a.barber_id].push(a)
+//     }
+//   }
+
+//   const nomesDias = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"]
+//   const linhas: string[] = ["=== AGENDA (próx. 7 dias | faixas de 30 em 30 min) ==="]
+
+//   for (let i = 0; i < 7; i++) {
+//     const dia = addDays(hoje, i)
+//     const dataISO = isoDate(dia)
+//     const diaSemana = dia.getDay()
+//     const dataFmt = `${nomesDias[diaSemana]} ${dia.getDate().toString().padStart(2, "0")}/${(dia.getMonth() + 1).toString().padStart(2, "0")} [${dataISO}]`
+
+//     const linhasBarbeiros: string[] = []
+
+//     for (const barbeiro of dados.barbeiros) {
+//       const periodos = barbeiro.availability.filter(
+//         (a) => a.day_of_week === diaSemana && !a.is_day_off
+//       )
+
+//       if (!periodos.length) continue
+
+//       let slots: string[] = []
+//       for (const p of periodos) {
+//         if (p.starts_at && p.ends_at) {
+//           slots.push(...gerarSlotsIntervalo(p.starts_at, p.ends_at, INTERVALO_SLOT_MIN))
+//         } else {
+//           // Barbeiro sem horário personalizado: usa horário da barbearia
+//           const horasBarbearia = dados.opening_hours.filter(
+//             (h) => h.day_of_week === diaSemana && h.is_open
+//           )
+//           for (const h of horasBarbearia) {
+//             slots.push(...gerarSlotsIntervalo(h.opens_at, h.closes_at, INTERVALO_SLOT_MIN))
+//           }
+//         }
+//       }
+
+//       // Para hoje: descarta slots com menos de MARGEM_FUTURO_MIN minutos
+//       if (i === 0) {
+//         const limite = new Date(Date.now() + MARGEM_FUTURO_MIN * 60000)
+//         slots = slots.filter((s) => new Date(`${dataISO}T${s}:00`) >= limite)
+//       }
+
+//       // Filtra slots ocupados usando os dados em memória
+//       const agendsBarbeiro = agendsPorBarbeiro[barbeiro.id] || []
+//       const livres = slots.filter((slot) => {
+//         const inicio = new Date(`${dataISO}T${slot}:00`)
+//         const fim = new Date(inicio.getTime() + INTERVALO_SLOT_MIN * 60000)
+//         return !agendsBarbeiro.some((a) => inicio < new Date(a.ends_at) && fim > new Date(a.starts_at))
+//       })
+
+//       if (livres.length > 0) {
+//         const servicosNomes = dados.servicos
+//           .filter((s) => barbeiro.services.includes(s.id))
+//           .map((s) => s.name)
+//           .join(", ")
+//         linhasBarbeiros.push(
+//           `  ${barbeiro.name} [id:${barbeiro.id}] (faz: ${servicosNomes}): ${slotsParaFaixas(livres)}`
+//         )
+//       }
+//     }
+
+//     // Só inclui o dia se houver pelo menos um barbeiro disponível
+//     if (linhasBarbeiros.length > 0) {
+//       linhas.push(`\n${dataFmt}:\n${linhasBarbeiros.join("\n")}`)
+//     }
+//   }
+
+//   return linhas.join("\n")
+// }
+
+// // ============================================
+// // PROCESSAMENTO — HAIKU GERENCIA O FLUXO
+// // ============================================
+// async function processarMensagem(
+//   texto: string,
+//   nomeCliente: string,
+//   clienteTelefone: string,
+//   dados: DadosBarbearia,
+//   historico: any[],
+//   isNova: boolean
+// ): Promise<{ resposta: string; novoStatus: string }> {
+//   // Prepara contexto em paralelo
+//   const [agendaSemana, agendamentosFuturos] = await Promise.all([
+//     computarAgendaSemana(dados),
+//     buscarAgendamentosFuturos(dados.barbershop_id, clienteTelefone),
+//   ])
+
+//   const agendFmt =
+//     agendamentosFuturos.length > 0
+//       ? agendamentosFuturos
+//           .map((a, i) => `${i + 1}. [id:${a.id}] ${a.servico} com ${a.barbeiro} — ${a.data} às ${a.hora}`)
+//           .join("\n")
+//       : "Nenhum agendamento futuro."
+
+//   const system = montarSystemPrompt(dados, nomeCliente, agendaSemana, agendFmt, isNova)
+
+//   // Histórico de conversa (só user/assistant)
+//   const mensagensAnteriores = historico
+//     .filter((h: any) => h.role === "user" || h.role === "assistant")
+//     .slice(-6)
+
+//   const messages = [...mensagensAnteriores, { role: "user", content: texto }]
+
+//   const respostaHaiku = await chamarHaiku(system, messages, 300)
+
+//   if (!respostaHaiku) {
+//     return { resposta: "Desculpe, tive um problema técnico. Pode repetir?", novoStatus: "em_andamento" }
+//   }
+
+//   // ---- Detecta ação AGENDAR ----
+//   const agendarMatch = respostaHaiku.match(/AGENDAR:\s*(\{[\s\S]*?\})/)
+//   if (agendarMatch) {
+//     try {
+//       const agData = JSON.parse(agendarMatch[1])
+//       console.log("[AGENDAR] Dados recebidos do Haiku:", JSON.stringify(agData))
+
+//       const resultado = await criarAgendamento(dados, agData, nomeCliente, clienteTelefone)
+
+//       if (resultado.success) {
+//         const dataFmt = formatarDataExibicao(agData.data)
+//         return {
+//           resposta: `✅ *Agendamento confirmado!*\n\n• Serviço: ${agData.servico_nome}\n• Barbeiro: ${resultado.barbeiroNome}\n• Data: ${dataFmt}\n• Horário: ${agData.hora}\n\nTe esperamos! Se precisar cancelar é só me chamar. 💈`,
+//           novoStatus: "concluida",
+//         }
+//       } else {
+//         console.error("[ERRO] criarAgendamento:", resultado.error)
+//         return {
+//           resposta: `Desculpe, não consegui confirmar o agendamento. 😔\n\n${resultado.error}\n\nQuer tentar outro horário?`,
+//           novoStatus: "em_andamento",
+//         }
+//       }
+//     } catch (err) {
+//       console.error("[ERRO] parsear AGENDAR:", err, "\nTexto:", agendarMatch[1])
+//       return {
+//         resposta: "Erro técnico ao confirmar. Pode tentar novamente?",
+//         novoStatus: "em_andamento",
+//       }
+//     }
+//   }
+
+//   // ---- Detecta ação CANCELAR ----
+//   const cancelarMatch = respostaHaiku.match(/CANCELAR:\s*(\{[\s\S]*?\})/)
+//   if (cancelarMatch) {
+//     try {
+//       const { agendamento_id } = JSON.parse(cancelarMatch[1])
+
+//       const { error } = await supabase
+//         .from("appointments")
+//         .update({ status: "cancelled_by_customer", updated_at: new Date().toISOString() })
+//         .eq("id", agendamento_id)
+//         .eq("barbershop_id", dados.barbershop_id) // segurança extra
+
+//       if (error) throw error
+
+//       return {
+//         resposta: "✅ Agendamento cancelado com sucesso! Se quiser fazer um novo, é só me chamar. 😊",
+//         novoStatus: "concluida",
+//       }
+//     } catch (err) {
+//       console.error("[ERRO] cancelar:", err)
+//       return {
+//         resposta: "Não consegui cancelar. Por favor, entre em contato conosco diretamente.",
+//         novoStatus: "em_andamento",
+//       }
+//     }
+//   }
+
+//   // Resposta normal do Haiku
+//   return { resposta: respostaHaiku, novoStatus: "em_andamento" }
+// }
+
+// function montarSystemPrompt(
+//   dados: DadosBarbearia,
+//   nomeCliente: string,
+//   agendaSemana: string,
+//   agendamentosFuturos: string,
+//   isNova: boolean
+// ): string {
+//   const listaServicos = dados.servicos
+//     .map((s) => {
+//       const preco = s.price ? `R$ ${Number(s.price).toFixed(2).replace(".", ",")}` : ""
+//       return `• ${s.name} [id:${s.id}] | ${preco} | ${s.duration_min}min`
+//     })
+//     .join("\n")
+
+//   const instrucao = isNova
+//     ? `Cumprimente ${nomeCliente} de forma calorosa e apresente os serviços disponíveis.`
+//     : `Continue a conversa com ${nomeCliente} de onde parou.`
+
+//   return `Você é o assistente virtual de agendamento da barbearia *${dados.barbershop_name}*.
+// Cliente: ${nomeCliente}
+
+// === SERVIÇOS ===
+// ${listaServicos}
+
+// ${agendaSemana}
+
+// === AGENDAMENTOS FUTUROS DO CLIENTE (para cancelamento) ===
+// ${agendamentosFuturos}
+
+// === INSTRUÇÕES ===
+// 1. ${instrucao}
+// 2. Colete: serviço, data, barbeiro e horário. Use APENAS barbeiros e dias da AGENDA. Os horários são faixas de 30 em 30 min (ex: 09:00-11:00 = slots disponíveis: 09:00, 09:30, 10:00, 10:30, 11:00). Ao confirmar, use sempre um horário exato de 30 em 30 min.
+// 3. Cada barbeiro realiza apenas os serviços indicados na agenda — respeite isso.
+// 4. Se o cliente não tiver preferência de barbeiro, você escolhe qualquer um que tenha o horário disponível.
+// 5. Quando tiver todos os dados, mostre o resumo e pergunte "Posso confirmar?".
+// 6. Após o cliente confirmar (sim / pode ser / ok / isso), responda SOMENTE com esta linha (sem mais nada):
+//    AGENDAR:{"servico_id":"ID","servico_nome":"NOME","barbeiro_id":"ID","barbeiro_nome":"NOME","data":"YYYY-MM-DD","hora":"HH:MM"}
+// 7. Para cancelamento: quando o cliente escolher qual cancelar, responda SOMENTE com:
+//    CANCELAR:{"agendamento_id":"ID"}
+// 8. O cliente pode mudar qualquer dado a qualquer momento antes de confirmar — adapte-se naturalmente.
+// 9. Linguagem informal e objetiva (português BR). Respostas curtas, máx 5 linhas (exceto ao listar opções).
+// 10. Nunca invente horários ou barbeiros. Se não há disponibilidade, diga claramente.`
+// }
+
+// // ============================================
+// // HAIKU
+// // ============================================
+// async function chamarHaiku(system: string, messages: any[], maxTokens: number): Promise<string> {
+//   if (!ANTHROPIC_API_KEY) {
+//     console.error("[ERRO] ANTHROPIC_API_KEY não configurado")
+//     return ""
+//   }
+
+//   try {
+//     const response = await fetch("https://api.anthropic.com/v1/messages", {
+//       method: "POST",
+//       headers: {
+//         "Content-Type": "application/json",
+//         "x-api-key": ANTHROPIC_API_KEY,
+//         "anthropic-version": "2023-06-01",
+//       },
+//       body: JSON.stringify({
+//         model: "claude-haiku-4-5-20251001",
+//         max_tokens: maxTokens,
+//         system,
+//         messages,
+//       }),
+//     })
+
+//     const data = await response.json()
+
+//     if (data.usage) {
+//       console.log(`[TOKENS] in:${data.usage.input_tokens} out:${data.usage.output_tokens}`)
+//     }
+
+//     if (!data.content?.[0]?.text) {
+//       console.error("[ERRO] Resposta inesperada Haiku:", JSON.stringify(data))
+//       return ""
+//     }
+
+//     return data.content[0].text.trim()
+//   } catch (err) {
+//     console.error("[ERRO] chamarHaiku:", err)
+//     return ""
+//   }
+// }
+
+// // ============================================
+// // AGENDAMENTOS
+// // ============================================
+// async function criarAgendamento(
+//   dados: DadosBarbearia,
+//   agData: {
+//     servico_id: string
+//     servico_nome: string
+//     barbeiro_id: string
+//     barbeiro_nome: string
+//     data: string
+//     hora: string
+//   },
+//   nomeCliente: string,
+//   clienteTelefone: string
+// ): Promise<{ success: boolean; error?: string; barbeiroNome?: string }> {
+//   try {
+//     // Valida serviço e barbeiro nos dados carregados
+//     const servico = dados.servicos.find((s) => s.id === agData.servico_id)
+//     if (!servico) return { success: false, error: "Serviço não reconhecido. Por favor, escolha novamente." }
+
+//     const barbeiro = dados.barbeiros.find((b) => b.id === agData.barbeiro_id)
+//     if (!barbeiro) return { success: false, error: "Barbeiro não reconhecido. Por favor, escolha novamente." }
+
+//     const duracaoMinutos = Number(servico.duration_min) || 30
+//     const slotInicio = new Date(`${agData.data}T${agData.hora}:00`)
+//     const slotFim = new Date(slotInicio.getTime() + duracaoMinutos * 60000)
+
+//     if (isNaN(slotInicio.getTime())) {
+//       return { success: false, error: "Data ou horário inválido. Por favor, escolha novamente." }
+//     }
+
+//     // Anti-race condition: verifica se o slot ainda está livre
+//     const { data: conflito } = await supabase
+//       .from("appointments")
+//       .select("id")
+//       .eq("barbershop_id", dados.barbershop_id)
+//       .eq("barber_id", barbeiro.id)
+//       .lt("starts_at", slotFim.toISOString())
+//       .gt("ends_at", slotInicio.toISOString())
+//       .not("status", "in", "(cancelled_by_customer,cancelled_by_barbershop)")
+//       .limit(1)
+
+//     if (conflito && conflito.length > 0) {
+//       return { success: false, error: "Este horário acabou de ser ocupado. Por favor, escolha outro." }
+//     }
+
+//     // Busca ou cria cliente pelo telefone
+//     const manualCustomerId = await buscarOuCriarClienteManual(
+//       dados.barbershop_id,
+//       nomeCliente,
+//       clienteTelefone
+//     )
+
+//     // Cria agendamento
+//     const { error } = await supabase.from("appointments").insert({
+//       barbershop_id: dados.barbershop_id,
+//       barber_id: barbeiro.id,
+//       service_id: servico.id,
+//       manual_customer_id: manualCustomerId || null,
+//       service_name: servico.name,
+//       service_price: servico.price,
+//       service_duration: duracaoMinutos,
+//       barber_name: barbeiro.name,
+//       customer_name: nomeCliente,
+//       starts_at: slotInicio.toISOString(),
+//       ends_at: slotFim.toISOString(),
+//       status: "scheduled",
+//     })
+
+//     if (error) {
+//       console.error("[ERRO] insert appointment:", error)
+//       return { success: false, error: "Não foi possível salvar o agendamento. Tente novamente." }
+//     }
+
+//     console.log(`[AGENDAMENTO] OK | ${servico.name} | ${barbeiro.name} | ${agData.data} ${agData.hora} | ${nomeCliente}`)
+//     return { success: true, barbeiroNome: barbeiro.name }
+//   } catch (err) {
+//     console.error("[ERRO] criarAgendamento:", err)
+//     return { success: false, error: "Erro inesperado ao criar agendamento." }
+//   }
+// }
+
+// async function buscarAgendamentosFuturos(
+//   barbershopId: string,
+//   telefone: string
+// ): Promise<Array<{ id: string; servico: string; barbeiro: string; data: string; hora: string }>> {
+//   const { data: cliente } = await supabase
+//     .from("customers")
+//     .select("id")
+//     .eq("barbershop_id", barbershopId)
+//     .eq("phone", telefone)
+//     .single()
+
+//   if (!cliente) return []
+
+//   const { data: agendamentos } = await supabase
+//     .from("appointments")
+//     .select("id, service_name, barber_name, starts_at")
+//     .eq("barbershop_id", barbershopId)
+//     .eq("manual_customer_id", cliente.id)
+//     .gte("starts_at", new Date().toISOString())
+//     .not("status", "in", "(cancelled_by_customer,cancelled_by_barbershop)")
+//     .order("starts_at", { ascending: true })
+//     .limit(5)
+
+//   return (agendamentos || []).map((a) => {
+//     const dt = new Date(a.starts_at)
+//     return {
+//       id: a.id,
+//       servico: a.service_name || "Serviço",
+//       barbeiro: a.barber_name || "Barbeiro",
+//       data: `${dt.getDate().toString().padStart(2, "0")}/${(dt.getMonth() + 1).toString().padStart(2, "0")}/${dt.getFullYear()}`,
+//       hora: `${dt.getHours().toString().padStart(2, "0")}:${dt.getMinutes().toString().padStart(2, "0")}`,
+//     }
+//   })
+// }
+
+// async function buscarOuCriarClienteManual(
+//   barbershopId: string,
+//   nomeCliente: string,
+//   telefone: string
+// ): Promise<string | null> {
+//   const { data: existente } = await supabase
+//     .from("customers")
+//     .select("id")
+//     .eq("barbershop_id", barbershopId)
+//     .eq("phone", telefone)
+//     .single()
+
+//   if (existente) return existente.id
+
+//   const { data: novo, error } = await supabase
+//     .from("customers")
+//     .insert({ barbershop_id: barbershopId, name: nomeCliente, phone: telefone })
+//     .select("id")
+//     .single()
+
+//   if (error) {
+//     console.error("[ERRO] buscarOuCriarClienteManual:", error)
+//     return null
+//   }
+
+//   return novo?.id || null
+// }
+
+// // ============================================
+// // ENVIO WHATSAPP
+// // ============================================
+// async function enviarWhatsApp(phoneNumberId: string, to: string, texto: string): Promise<void> {
+//   const token = Deno.env.get("WHATSAPP_TOKEN")
+//   if (!token) {
+//     console.error("[ERRO] WHATSAPP_TOKEN não configurado")
+//     return
+//   }
+
+//   try {
+//     const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+//       method: "POST",
+//       headers: {
+//         Authorization: `Bearer ${token}`,
+//         "Content-Type": "application/json",
+//       },
+//       body: JSON.stringify({
+//         messaging_product: "whatsapp",
+//         to,
+//         type: "text",
+//         text: { body: texto },
+//       }),
+//     })
+//     const result = await response.json()
+//     if (result.error) console.error("[ERRO] enviarWhatsApp:", JSON.stringify(result.error))
+//   } catch (err) {
+//     console.error("[ERRO] enviarWhatsApp:", err)
+//   }
+// }
+
+// // ============================================
+// // UTILITÁRIOS
+// // ============================================
+// function slotsParaFaixas(slots: string[]): string {
+//   if (!slots.length) return ""
+//   const resultado: string[] = []
+//   let inicio = slots[0]
+//   let ultimo = slots[0]
+
+//   for (let i = 1; i < slots.length; i++) {
+//     const [hA, mA] = ultimo.split(":").map(Number)
+//     const [hB, mB] = slots[i].split(":").map(Number)
+//     if (hB * 60 + mB - (hA * 60 + mA) === 30) {
+//       ultimo = slots[i]
+//     } else {
+//       resultado.push(inicio === ultimo ? inicio : `${inicio}-${ultimo}`)
+//       inicio = slots[i]
+//       ultimo = slots[i]
+//     }
+//   }
+//   resultado.push(inicio === ultimo ? inicio : `${inicio}-${ultimo}`)
+//   return resultado.join(" ")
+// }
+
+// function gerarSlotsIntervalo(horaInicio: string, horaFim: string, intervaloMin: number): string[] {
+//   if (!horaInicio || !horaFim) return []
+//   const [hI, mI] = horaInicio.split(":").map(Number)
+//   const [hF, mF] = horaFim.split(":").map(Number)
+//   if ([hI, mI, hF, mF].some(isNaN)) return []
+
+//   const slots: string[] = []
+//   let atual = new Date(2000, 0, 1, hI, mI)
+//   const fim = new Date(2000, 0, 1, hF, mF)
+
+//   while (atual < fim) {
+//     slots.push(
+//       `${String(atual.getHours()).padStart(2, "0")}:${String(atual.getMinutes()).padStart(2, "0")}`
+//     )
+//     atual = new Date(atual.getTime() + intervaloMin * 60000)
+//   }
+
+//   return slots
+// }
+
+// function addDays(data: Date, dias: number): Date {
+//   const d = new Date(data)
+//   d.setDate(d.getDate() + dias)
+//   return d
+// }
+
+// function isoDate(d: Date): string {
+//   return d.toISOString().split("T")[0]
+// }
+
+// function formatarDataExibicao(iso: string): string {
+//   const [ano, mes, dia] = iso.split("-").map(Number)
+//   const d = new Date(ano, mes - 1, dia)
+//   const nomes = ["domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"]
+//   return `${nomes[d.getDay()]}, ${dia.toString().padStart(2, "0")}/${mes.toString().padStart(2, "0")}/${ano}`
+// }
+
+
+
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "jsr:@supabase/supabase-js@2"
 
-// ============================================
-// CONSTANTES E CONFIGURAÇÃO
-// ============================================
 const VERIFY_TOKEN = "virtual_barber_webhook_2026"
-const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY") || ""
-// ID fixo da barbearia de teste — configurar na env do Supabase
-const BARBERSHOP_TEST_ID = Deno.env.get("BARBERSHOP_TEST_ID") || ""
-const TEMPO_SESSAO_HORAS = 4
-
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 )
 
 // ============================================
-// TIPOS
+// DADOS MOCKADOS
 // ============================================
-interface Servico {
-  id: string
-  name: string
-  price: number
-  duration_min: number
-}
+const BARBERSHOP_NAME_MOCK = "Barbearia do Vitor"
 
-interface DisponibilidadeBarbeiro {
-  day_of_week: number
-  starts_at: string
-  ends_at: string
-  is_day_off: boolean
-  period_order: number
-}
+const SERVICOS_MOCK = [
+  { id: "1", name: "✂️ Corte Tradicional", price: 35, duration: 30 },
+  { id: "2", name: "✂️ Corte Degradê", price: 45, duration: 40 },
+  { id: "3", name: "✂️ Corte Social", price: 40, duration: 35 },
+  { id: "4", name: "✂️ Corte Americano", price: 50, duration: 45 },
+  { id: "5", name: "✂️ Corte Militar", price: 30, duration: 25 },
+  { id: "6", name: "✂️ Corte UnderCut", price: 55, duration: 50 },
+  { id: "7", name: "✂️ Corte Moicano", price: 45, duration: 40 },
+  { id: "8", name: "✂️ Corte com Máquina", price: 35, duration: 30 },
+  { id: "9", name: "✂️ Corte na Tesoura", price: 50, duration: 45 },
+  { id: "10", name: "🧔 Barba Completa", price: 30, duration: 25 },
+  { id: "11", name: "🧔 Barba Desenhada", price: 35, duration: 30 },
+  { id: "12", name: "🧔 Barba com Navalha", price: 40, duration: 35 },
+  { id: "13", name: "🧔 Aparar Barba", price: 20, duration: 15 },
+  { id: "14", name: "🧔 Sobrancelha", price: 15, duration: 10 },
+  { id: "15", name: "🧔 Pigmentação de Barba", price: 80, duration: 60 },
+  { id: "16", name: "💈 Corte + Barba", price: 60, duration: 50 },
+  { id: "17", name: "💈 Corte + Sobrancelha", price: 45, duration: 40 },
+  { id: "18", name: "💈 Barba + Sobrancelha", price: 40, duration: 35 },
+  { id: "19", name: "💈 Combo Premium", price: 90, duration: 75 },
+  { id: "20", name: "🎨 Platinado", price: 150, duration: 120 },
+  { id: "21", name: "🎨 Luzes", price: 120, duration: 90 },
+  { id: "22", name: "🎨 Coloração", price: 100, duration: 75 },
+  { id: "23", name: "🎨 Mechas", price: 130, duration: 100 },
+  { id: "24", name: "💆 Terapia Capilar", price: 70, duration: 45 },
+  { id: "25", name: "💆 Hidratação", price: 50, duration: 35 },
+  { id: "26", name: "💆 Alisamento", price: 120, duration: 90 },
+  { id: "27", name: "👦 Corte Infantil", price: 30, duration: 25 },
+  { id: "28", name: "👨‍🦳 Corte Sênior", price: 35, duration: 30 },
+  { id: "29", name: "🎭 Design de Barba", price: 45, duration: 40 },
+  { id: "30", name: "✨ Finalização", price: 20, duration: 15 }
+]
 
-interface Barbeiro {
-  id: string
-  name: string
-  description: string
-  availability: DisponibilidadeBarbeiro[]
-  services: string[] // IDs dos serviços que realiza
-}
+const BARBEIROS_MOCK = [
+  { id: "1", name: "Carlos", rating: 4.9, especialidade: "Degradê" },
+  { id: "2", name: "Rafael", rating: 4.8, especialidade: "Barba" },
+  { id: "3", name: "Eduardo", rating: 4.9, especialidade: "Platinados" },
+  { id: "4", name: "Lucas", rating: 4.7, especialidade: "Cortes Sociais" },
+  { id: "5", name: "Gustavo", rating: 4.8, especialidade: "Navalha" },
+  { id: "6", name: "André", rating: 4.6, especialidade: "Cortes Infantis" },
+  { id: "7", name: "Mateus", rating: 4.5, especialidade: "Aprendiz" },
+  { id: "8", name: "Bruno", rating: 4.7, especialidade: "Finalização" },
+  { id: "9", name: "Felipe", rating: 4.8, especialidade: "Terapia" },
+  { id: "10", name: "Rodrigo", rating: 4.9, especialidade: "Militares" },
+  { id: "11", name: "Samuel", rating: 4.7, especialidade: "UnderCut" },
+  { id: "12", name: "Thiago", rating: 4.8, especialidade: "Barba Desenhada" },
+  { id: "13", name: "Diego", rating: 4.6, especialidade: "Cabelo Cacheado" },
+  { id: "14", name: "Henrique", rating: 4.9, especialidade: "Platinado" },
+  { id: "15", name: "Leonardo", rating: 4.7, especialidade: "Tesoura" },
+  { id: "16", name: "Vinicius", rating: 4.8, especialidade: "Máquina" },
+  { id: "17", name: "Paulo", rating: 4.6, especialidade: "Mechas" },
+  { id: "18", name: "Marcelo", rating: 4.7, especialidade: "Coloração" },
+  { id: "19", name: "Renato", rating: 4.8, especialidade: "Luzes" },
+  { id: "20", name: "Fábio", rating: 4.9, especialidade: "Premium" }
+]
 
-interface DadosBarbearia {
-  barbershop_id: string
-  barbershop_name: string
-  phone: string
-  address: string
-  servicos: Servico[]
-  barbeiros: Barbeiro[]
-}
-
-interface EstadoColeta {
-  etapa: "inicio" | "servico" | "dia" | "barbeiro" | "horario" | "confirmacao"
-  servico_escolhido?: Servico
-  dia_escolhido?: string   // YYYY-MM-DD
-  dia_semana?: number      // 0-6
-  dia_label?: string
-  barbeiros_disponiveis?: Array<{ id: string; name: string; description: string }>
-  barbeiro_escolhido?: { id: string; name: string } // id pode ser 'sem_preferencia'
-  // Para "sem preferência": slot -> lista de barbeiro_ids livres naquele slot
-  slot_barbeiros_map?: Record<string, string[]>
-  horarios_disponiveis?: string[]
-  horario_escolhido?: string
+interface EstadoTeste {
+  etapa: 'inicio' | 'servico' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao'
+  servico?: typeof SERVICOS_MOCK[0]
+  dia?: string
+  barbeiro?: typeof BARBEIROS_MOCK[0]
+  horario?: string
+  paginaBarbeiros: number
+  jaEnviouBoasVindas: boolean  // 🔥 NOVO: controla se já enviou a saudação
 }
 
 // ============================================
@@ -75,7 +858,6 @@ Deno.serve(async (req) => {
     const token = url.searchParams.get("hub.verify_token")
     const challenge = url.searchParams.get("hub.challenge")
     if (mode === "subscribe" && token === VERIFY_TOKEN) {
-      console.log("Webhook verificado com sucesso!")
       return new Response(challenge, { status: 200 })
     }
     return new Response("Token invalido", { status: 403 })
@@ -86,82 +868,78 @@ Deno.serve(async (req) => {
       const body = await req.json()
       const value = body.entry?.[0]?.changes?.[0]?.value
 
+      console.log("🟢 body:", JSON.stringify(body).substring(0, 500))
+      console.log("🟢 value:", JSON.stringify(value).substring(0, 500))
+
+      //VERIFICA SE É SÓ STATUS (ex: mensagem entregue) — se for, ignora
       if (value?.statuses?.length > 0) {
-        console.log(`Status: ${value.statuses[0].status}`)
         return new Response("OK", { status: 200 })
       }
 
+      //VERIFICA SE TEM MENSAGEM — se não tiver, ignora
       if (!value?.messages?.length) {
         return new Response("OK", { status: 200 })
       }
 
-      const msg = value.messages[0]
-      const from = msg.from
-      const phoneNumberId = value.metadata?.phone_number_id || value.phone_number_id
-      const nomeCliente = value.contacts?.[0]?.profile?.name || "Cliente"
+      const nomeBarbearia = BARBERSHOP_NAME_MOCK
+      const msg = value.messages[0] //OBJETO DA MENSAGEM DO CLIENTE
+      const from = msg.from //NUMERO DO CLIENTE
+      const phoneNumberId = value.metadata?.phone_number_id || value.phone_number_id //ID DO WHATSAPP DA BARBEARIA
+      const nomeCliente = value.contacts?.[0]?.profile?.name || "Cliente" //NOME DO CLIENTE
 
-      if (msg.type !== "text") {
-        await enviarWhatsApp(
-          phoneNumberId,
-          from,
-          "Desculpe, ainda não consigo processar esse tipo de mensagem. Por favor, envie texto."
-        )
+      let texto = msg.text?.body?.trim() || ""
+      
+      //DETECTA SE É INTERAÇÃO (clique em botão ou lista)
+      const isInteractive = msg.type === "interactive"
+
+      //SE FOR INTERAÇÃO, PEGA O ID DO BOTÃO CLICADO OU OPÇÃO DE LISTA, CASO EXISTA
+      if (isInteractive) {
+        texto = msg.interactive?.button_reply?.id || 
+                msg.interactive?.list_reply?.id || 
+                texto
+      }
+
+      console.log(`[MSG] ${nomeCliente}: "${texto}" | tipo: ${msg.type}`)
+
+      // BUSCA O ESTADO DA CONVERSA NA TABELA conversations_chatbot DO BANCO DE DADOS
+      let estado = await buscarEstadoConversa(from)
+      
+      console.log(`[ESTADO] etapa: ${estado.etapa}, jaEnviouBoasVindas: ${estado.jaEnviouBoasVindas}`)
+
+      // SÓ ENVIA BOAS-VINDAS SE:
+      // 1. Ainda não enviou E
+      // 2. NÃO é uma interação (clique em botão)
+      if (!estado.jaEnviouBoasVindas && !isInteractive) {
+        console.log(`[ENVIO] Primeira interação - enviando botão`)
+        await enviarBotoesIniciais(phoneNumberId, BARBERSHOP_NAME_MOCK, from, nomeCliente)
+        
+        estado.jaEnviouBoasVindas = true
+        estado.etapa = 'inicio'
+        await salvarEstadoConversa(from, estado)
         return new Response("OK", { status: 200 })
       }
 
-      const texto = msg.text.body.trim()
-      console.log(`[MSG] ${nomeCliente} (${from}): ${texto}`)
-
-      // Recupera ou cria sessão de conversa
-      const { conversa, isNova } = await getOuCriarConversa(phoneNumberId, from)
-      let historico: any[] = conversa.historic as any[]
-
-      // Busca dados da barbearia (sempre necessário)
-      let dadosBarbearia = extrairDadosBarbearia(historico)
-      if (!dadosBarbearia || isNova) {
-        dadosBarbearia = await buscarDadosBarbearia()
-        if (!dadosBarbearia) {
-          await enviarWhatsApp(phoneNumberId, from, "Desculpe, estamos com dificuldades técnicas. Tente novamente em instantes.")
-          return new Response("OK", { status: 200 })
-        }
-        if (isNova) {
-          historico = gerarHistoricoInicial(dadosBarbearia)
-          await atualizarHistorico(conversa.id, historico, "em_andamento")
-        } else {
-          // Apenas atualiza os dados da barbearia no histórico existente
-          historico = substituirDadosBarbearia(historico, dadosBarbearia)
-        }
+      // Se é interação mas ainda não tem estado inicializado, inicializa
+      if (isInteractive && !estado.jaEnviouBoasVindas) {
+        estado.jaEnviouBoasVindas = true
+        estado.etapa = 'inicio'
       }
 
-      const estado = extrairEstado(historico)
+      // Processa resposta
+      const resposta = await processarComBotoes(texto, nomeCliente, estado)
 
-      const { resposta, estadoAtualizado, novoStatus } = await processarMensagem(
-        texto,
-        nomeCliente,
-        from,
-        dadosBarbearia,
-        estado,
-        historico,
-        isNova
-      )
+      // Salva estado atualizado
+      await salvarEstadoConversa(from, estado)
 
-      // Salva mensagem do usuário, resposta e estado atualizado no histórico
-      const historicoFinal = [
-        ...historico.filter(
-          (h: any) => !(h.role === "system" && h.tipo === "estado_coleta")
-        ),
-        { role: "user", content: texto },
-        { role: "assistant", content: resposta },
-        { role: "system", tipo: "estado_coleta", content: estadoAtualizado },
-      ]
-
-      await atualizarHistorico(conversa.id, historicoFinal, novoStatus)
-      await enviarWhatsApp(phoneNumberId, from, resposta)
-      console.log(`[RESP] → ${from}: ${resposta.substring(0, 80)}...`)
+      // Envia resposta se houver
+      if (resposta) {
+        await enviarWhatsApp(phoneNumberId, from, resposta)
+      }
+      console.log(`[RESP] → ${from}`)
 
       return new Response("OK", { status: 200 })
     } catch (error) {
-      console.error("[ERRO CRÍTICO]", error)
+      console.error("[ERRO]", error)
       return new Response("OK", { status: 200 })
     }
   }
@@ -170,1029 +948,315 @@ Deno.serve(async (req) => {
 })
 
 // ============================================
-// GESTÃO DE SESSÃO
+// GESTÃO DE ESTADO
 // ============================================
 
-async function getOuCriarConversa(
-  phoneNumberId: string,
-  clienteNumero: string
-): Promise<{ conversa: any; isNova: boolean }> {
-  if (!BARBERSHOP_TEST_ID) {
-    throw new Error("BARBERSHOP_TEST_ID não configurado")
-  }
-
-  // Busca conversa em andamento para este cliente
-  const { data: existente } = await supabase
+async function buscarEstadoConversa(clienteNumero: string): Promise<EstadoTeste> {
+  const { data } = await supabase
     .from("conversations_chatbot")
-    .select("*")
-    .eq("barbershop_id", BARBERSHOP_TEST_ID)
+    .select("historic")
     .eq("client_phone_number_id", clienteNumero)
     .eq("status", "em_andamento")
     .order("updated_at", { ascending: false })
     .limit(1)
     .single()
 
-  if (existente) {
-    const updatedAt = new Date(existente.updated_at)
-    const agora = new Date()
-    const diferencaHoras = (agora.getTime() - updatedAt.getTime()) / (1000 * 60 * 60)
-
-    if (diferencaHoras < TEMPO_SESSAO_HORAS) {
-      console.log(`[SESSÃO] Conversa ativa encontrada (${diferencaHoras.toFixed(1)}h atrás)`)
-      return { conversa: existente, isNova: false }
+  if (data?.historic && data.historic.length > 0) {
+    const ultimoEstado = data.historic.find((h: any) => h.tipo === "estado_teste")
+    if (ultimoEstado) {
+      return ultimoEstado.content as EstadoTeste
     }
+  }
 
-    // Sessão expirada — exclui e cria nova
-    console.log(`[SESSÃO] Sessão expirada (${diferencaHoras.toFixed(1)}h). Criando nova...`)
+  return { etapa: 'inicio', paginaBarbeiros: 1, jaEnviouBoasVindas: false }
+}
+
+async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste): Promise<void> {
+  const { data: conversa } = await supabase
+    .from("conversations_chatbot")
+    .select("id, historic")
+    .eq("client_phone_number_id", clienteNumero)
+    .eq("status", "em_andamento")
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .single()
+
+  if (conversa) {
+    const historic = conversa.historic || []
+    const outrosHistoricos = historic.filter((h: any) => h.tipo !== "estado_teste")
+    const novoHistorico = [...outrosHistoricos, { role: "system", tipo: "estado_teste", content: estado }]
+    
     await supabase
       .from("conversations_chatbot")
-      .delete()
-      .eq("id", existente.id)
-  }
-
-  // Cria nova conversa
-  const { data: nova, error } = await supabase
-    .from("conversations_chatbot")
-    .insert({
-      barbershop_id: BARBERSHOP_TEST_ID,
-      barbershop_phone_number_id: phoneNumberId,
-      client_phone_number_id: clienteNumero,
-      historic: [],
-      status: "em_andamento",
-    })
-    .select()
-    .single()
-
-  if (error || !nova) {
-    console.error("[ERRO] Falha ao criar conversa:", error)
-    throw new Error("Não foi possível criar a conversa")
-  }
-
-  console.log("[SESSÃO] Nova conversa criada:", nova.id)
-  return { conversa: nova, isNova: true }
-}
-
-// ============================================
-// DADOS DA BARBEARIA
-// ============================================
-
-async function buscarDadosBarbearia(): Promise<DadosBarbearia | null> {
-  const { data: barbearia } = await supabase
-    .from("barbershops")
-    .select("id, name, phone, addresses(city, neighborhood, street, number)")
-    .eq("id", BARBERSHOP_TEST_ID)
-    .single()
-
-  if (!barbearia) {
-    console.error("[ERRO] Barbearia de teste não encontrada:", BARBERSHOP_TEST_ID)
-    return null
-  }
-
-  const { data: servicos } = await supabase
-    .from("services")
-    .select("id, name, price, duration_min")
-    .eq("barbershop_id", BARBERSHOP_TEST_ID)
-    .eq("is_active", true)
-    .order("name")
-
-  const { data: barbeiros } = await supabase
-    .from("barbers")
-    .select(`
-      id, name, description,
-      barber_availability(day_of_week, starts_at, ends_at, is_day_off, period_order),
-      barber_services(service_id)
-    `)
-    .eq("barbershop_id", BARBERSHOP_TEST_ID)
-    .eq("is_active", true)
-
-  const addr = barbearia.addresses?.[0]
-  const enderecoFormatado = addr
-    ? `${addr.street}, ${addr.number} - ${addr.neighborhood}, ${addr.city}`
-    : "Endereço não informado"
-
-  return {
-    barbershop_id: barbearia.id,
-    barbershop_name: barbearia.name,
-    phone: barbearia.phone || "",
-    address: enderecoFormatado,
-    servicos: (servicos || []) as Servico[],
-    barbeiros: (barbeiros || []).map((b: any) => ({
-      id: b.id,
-      name: b.name,
-      description: b.description || "",
-      availability: (b.barber_availability || []) as DisponibilidadeBarbeiro[],
-      services: (b.barber_services || []).map((s: any) => s.service_id),
-    })),
+      .update({ historic: novoHistorico, updated_at: new Date().toISOString() })
+      .eq("id", conversa.id)
+  } else {
+    await supabase
+      .from("conversations_chatbot")
+      .insert({
+        barbershop_id: "teste",
+        barbershop_phone_number_id: "teste",
+        client_phone_number_id: clienteNumero,
+        historic: [{ role: "system", tipo: "estado_teste", content: estado }],
+        status: "em_andamento",
+      })
   }
 }
 
 // ============================================
-// HISTÓRICO (helpers)
+// PROCESSAMENTO
 // ============================================
-
-function gerarHistoricoInicial(dados: DadosBarbearia): any[] {
-  return [
-    { role: "system", tipo: "dados_barbearia", content: dados },
-    { role: "system", tipo: "estado_coleta", content: { etapa: "inicio" } as EstadoColeta },
-  ]
-}
-
-function substituirDadosBarbearia(historico: any[], dados: DadosBarbearia): any[] {
-  const semDados = historico.filter(
-    (h: any) => !(h.role === "system" && h.tipo === "dados_barbearia")
-  )
-  return [{ role: "system", tipo: "dados_barbearia", content: dados }, ...semDados]
-}
-
-function extrairDadosBarbearia(historico: any[]): DadosBarbearia | null {
-  return (
-    historico.find((h: any) => h.role === "system" && h.tipo === "dados_barbearia")
-      ?.content || null
-  )
-}
-
-function extrairEstado(historico: any[]): EstadoColeta {
-  return (
-    historico.find((h: any) => h.role === "system" && h.tipo === "estado_coleta")
-      ?.content || { etapa: "inicio" }
-  )
-}
-
-async function atualizarHistorico(
-  conversaId: string,
-  historico: any[],
-  status: string
-): Promise<void> {
-  const { error } = await supabase
-    .from("conversations_chatbot")
-    .update({ historic: historico, status, updated_at: new Date().toISOString() })
-    .eq("id", conversaId)
-
-  if (error) console.error("[ERRO] atualizarHistorico:", error)
-}
-
-// ============================================
-// PROCESSADOR DE MENSAGENS (máquina de estados)
-// ============================================
-
-async function processarMensagem(
+async function processarComBotoes(
   texto: string,
   nomeCliente: string,
-  clienteTelefone: string,
-  dados: DadosBarbearia,
-  estado: EstadoColeta,
-  historico: any[],
-  isNova: boolean
-): Promise<{ resposta: string; estadoAtualizado: EstadoColeta; novoStatus: string }> {
-  let estadoAtualizado = { ...estado }
-  let novoStatus = "em_andamento"
-
-  try {
-    // Nova sessão → boas-vindas independente da etapa salva
-    if (isNova) {
-      estadoAtualizado = { etapa: "servico" }
-      const resposta = await haikuBoasVindas(dados, nomeCliente, historico)
-      return { resposta, estadoAtualizado, novoStatus }
-    }
-
-    switch (estado.etapa) {
-      // --------------------------------------------------
-      case "inicio":
-      case "servico": {
-        if (estado.etapa === "inicio") {
-          estadoAtualizado = { etapa: "servico" }
-          const resposta = await haikuBoasVindas(dados, nomeCliente, historico)
-          return { resposta, estadoAtualizado, novoStatus }
-        }
-
-        // Interpreta qual serviço o cliente quer (Haiku com fuzzy matching)
-        const servicoId = await interpretarEscolhaHaiku(
-          texto,
-          dados.servicos.map((s) => ({ id: s.id, name: s.name })),
-          "serviço"
-        )
-
-        if (servicoId) {
-          const servico = dados.servicos.find((s) => s.id === servicoId)!
-          estadoAtualizado = { etapa: "dia", servico_escolhido: servico }
-          const precoFmt = servico.price
-            ? `R$ ${Number(servico.price).toFixed(2).replace(".", ",")}`
-            : ""
-          return {
-            resposta: `Ótimo! *${servico.name}*${precoFmt ? ` (${precoFmt})` : ""} escolhido! ✂️\n\nPra qual dia você quer agendar? Pode dizer hoje, amanhã, ou o dia da semana (ex: terça, sábado)...`,
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        // Não identificou o serviço → Haiku reformula
-        const resposta = await haikuContexto(
-          dados,
-          nomeCliente,
-          "O cliente não escolheu um serviço válido ou não entendemos. Reapresente a lista de serviços de forma amigável e peça para escolher.",
-          historico
-        )
-        return { resposta, estadoAtualizado, novoStatus }
-      }
-
-      // --------------------------------------------------
-      case "dia": {
-        const dia = parsearDia(texto)
-
-        if (!dia) {
-          return {
-            resposta: "Não entendi o dia. 😅 Pode dizer *hoje*, *amanhã* ou o dia da semana? (ex: *terça*, *sábado*)",
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        // Filtra barbeiros disponíveis no dia E que fazem o serviço escolhido
-        const barbeirosFiltrados = dados.barbeiros.filter((b) => {
-          const temDisponibilidade = b.availability.some(
-            (a) => a.day_of_week === dia.diaSemana && !a.is_day_off
-          )
-          const fazServico = b.services.includes(estado.servico_escolhido!.id)
-          return temDisponibilidade && fazServico
-        })
-
-        if (barbeirosFiltrados.length === 0) {
-          estadoAtualizado = {
-            ...estado,
-            etapa: "dia",
-            dia_escolhido: undefined,
-            dia_semana: undefined,
-          }
-          return {
-            resposta: `Infelizmente não há barbeiros disponíveis para *${estado.servico_escolhido!.name}* na *${dia.label}*. 😕\n\nQue tal escolher outro dia?`,
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        const disponiveis = barbeirosFiltrados.map((b) => ({
-          id: b.id,
-          name: b.name,
-          description: b.description,
-        }))
-
-        estadoAtualizado = {
-          ...estado,
-          etapa: "barbeiro",
-          dia_escolhido: dia.data,
-          dia_semana: dia.diaSemana,
-          dia_label: dia.label,
-          barbeiros_disponiveis: disponiveis,
-        }
-
-        const lista = disponiveis
-          .map((b, i) => `${i + 1}. ${b.name}${b.description ? ` — ${b.description}` : ""}`)
-          .join("\n")
-
-        return {
-          resposta: `Na *${dia.label}* temos os seguintes barbeiros disponíveis:\n\n${lista}\n${disponiveis.length + 1}. Sem preferência\n\nQual você prefere?`,
-          estadoAtualizado,
-          novoStatus,
-        }
-      }
-
-      // --------------------------------------------------
-      case "barbeiro": {
-        if (!estado.barbeiros_disponiveis?.length) {
-          estadoAtualizado = { ...estado, etapa: "dia" }
-          return {
-            resposta: "Desculpe, tive um problema. Para qual dia você quer agendar?",
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        // Verifica se cliente disse "sem preferência"
-        const textoNorm = normalizar(texto)
-        const semPreferencia = textoNorm.match(
-          /sem prefer|tanto faz|qualquer|nao importa|não importa|qualquer um/
-        ) || textoNorm === String(estado.barbeiros_disponiveis.length + 1)
-
-        let barbeiroId: string | null = null
-
-        if (semPreferencia) {
-          barbeiroId = "sem_preferencia"
-        } else {
-          barbeiroId = await interpretarEscolhaHaiku(
-            texto,
-            estado.barbeiros_disponiveis,
-            "barbeiro"
-          )
-        }
-
-        if (!barbeiroId) {
-          const lista = estado.barbeiros_disponiveis
-            .map((b, i) => `${i + 1}. ${b.name}`)
-            .join("\n")
-          return {
-            resposta: `Não entendi. Os barbeiros disponíveis são:\n\n${lista}\n${estado.barbeiros_disponiveis.length + 1}. Sem preferência\n\nQual você prefere?`,
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        // Gera slots disponíveis
-        const { horarios, slotBarbeirosMap } = await gerarSlotsDisponiveis(
-          dados,
-          estado,
-          barbeiroId
-        )
-
-        if (horarios.length === 0) {
-          const nomeBarbeiro =
-            barbeiroId === "sem_preferencia"
-              ? "nenhum barbeiro"
-              : estado.barbeiros_disponiveis.find((b) => b.id === barbeiroId)?.name || "o barbeiro"
-
-          estadoAtualizado = { ...estado, etapa: "dia" }
-          return {
-            resposta: `${nomeBarbeiro === "nenhum barbeiro" ? "Não há" : `*${nomeBarbeiro}* não tem`} horários disponíveis para *${estado.dia_label}*. 😕\n\nQuer tentar outro dia?`,
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        const nomeBarbeiro =
-          barbeiroId === "sem_preferencia"
-            ? "Sem preferência"
-            : estado.barbeiros_disponiveis.find((b) => b.id === barbeiroId)?.name || ""
-
-        estadoAtualizado = {
-          ...estado,
-          etapa: "horario",
-          barbeiro_escolhido: { id: barbeiroId, name: nomeBarbeiro },
-          horarios_disponiveis: horarios,
-          slot_barbeiros_map: slotBarbeirosMap,
-        }
-
-        const listaHorarios = horarios.map((h, i) => `${i + 1}. ${h}`).join("\n")
-        return {
-          resposta: `Horários disponíveis na *${estado.dia_label}*:\n\n${listaHorarios}\n\nQual horário prefere?`,
-          estadoAtualizado,
-          novoStatus,
-        }
-      }
-
-      // --------------------------------------------------
-      case "horario": {
-        if (!estado.horarios_disponiveis?.length) {
-          estadoAtualizado = { ...estado, etapa: "dia" }
-          return {
-            resposta: "Desculpe, tive um problema com os horários. Para qual dia você quer agendar?",
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        const horarioMatch = parsearHorario(texto, estado.horarios_disponiveis)
-
-        if (!horarioMatch) {
-          const lista = estado.horarios_disponiveis.join(", ")
-          return {
-            resposta: `Não entendi o horário. Os disponíveis são: ${lista}\n\nQual você prefere?`,
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        estadoAtualizado = {
-          ...estado,
-          etapa: "confirmacao",
-          horario_escolhido: horarioMatch,
-        }
-
-        return {
-          resposta: montarResumoAgendamento(estadoAtualizado),
-          estadoAtualizado,
-          novoStatus,
-        }
-      }
-
-      // --------------------------------------------------
-      case "confirmacao": {
-        const textoNorm = normalizar(texto)
-
-        if (textoNorm.match(/sim|confirma|pode ser|ta bom|tá bom|fechado|yes|ok|quero|confirmo/)) {
-          // Tenta criar o agendamento
-          const resultado = await criarAgendamento(dados, estado, nomeCliente, clienteTelefone)
-
-          if (resultado.success) {
-            novoStatus = "concluida"
-            const dataFormatada = formatarDataExibicao(estado.dia_escolhido!)
-            estadoAtualizado = { etapa: "servico" } // reseta para eventual próxima sessão
-            return {
-              resposta: `✅ *Agendamento confirmado!*\n\n${estado.servico_escolhido!.name} com ${estado.barbeiro_escolhido!.name === "Sem preferência" ? resultado.barbeiroNome : estado.barbeiro_escolhido!.name} na *${dataFormatada}* às *${estado.horario_escolhido}*.\n\nTe esperamos! Se precisar cancelar ou remarcar, entre em contato. 💈`,
-              estadoAtualizado,
-              novoStatus,
-            }
-          } else {
-            // Falhou — não confirma ao cliente
-            console.error("[ERRO] Falha ao criar agendamento:", resultado.error)
-            return {
-              resposta: `Desculpe, não consegui confirmar seu agendamento. 😔\n\n${resultado.error || "Ocorreu um erro técnico."}\n\nPor favor, tente novamente ou entre em contato conosco diretamente.`,
-              estadoAtualizado,
-              novoStatus,
-            }
-          }
-        }
-
-        if (textoNorm.match(/nao|não|cancela|outro|mudar|errado|corrigir/)) {
-          estadoAtualizado = { etapa: "servico" }
-          const lista = dados.servicos
-            .map((s, i) => `${i + 1}. ${s.name}`)
-            .join("\n")
-          return {
-            resposta: `Sem problema! Vamos recomeçar. 😊\n\nQual serviço você quer agendar?\n\n${lista}`,
-            estadoAtualizado,
-            novoStatus,
-          }
-        }
-
-        return {
-          resposta: `Confirma o agendamento? Responda *sim* para confirmar ou *não* para recomeçar.\n\n${montarResumoAgendamento(estado)}`,
-          estadoAtualizado,
-          novoStatus,
-        }
-      }
-    }
-  } catch (error) {
-    console.error("[ERRO] processarMensagem:", error)
-    const lista = dados.servicos.map((s) => s.name).join(", ")
-    return {
-      resposta: `Desculpe o transtorno, ${nomeCliente}! Tive um problema técnico. Vamos recomeçar? Qual serviço você quer agendar? (${lista})`,
-      estadoAtualizado: { etapa: "servico" },
-      novoStatus: "em_andamento",
-    }
+  estado: EstadoTeste
+): Promise<string> {
+  
+  // CLIQUE NO BOTÃO AGENDAR
+  if (texto === "acao_agendar") {
+    estado.etapa = 'servico'
+    return enviarMenuServicos()
   }
 
-  return {
-    resposta: "Desculpe, não entendi. Pode repetir?",
-    estadoAtualizado,
-    novoStatus,
+  // CLIQUE NO BOTÃO MEUS AGENDAMENTOS
+  if (texto === "acao_meus_agendamentos") {
+    estado.etapa = 'listar_agendamentos'
+    return enviarMenuServicos()
   }
+
+  //CLIQUE NO BOTÃO INFORMAÇÕES
+  if (texto === "acao_informacoes") {
+    estado.etapa = 'informacoes'
+    return enviarMenuServicos()
+  }
+
+  // COMANDOS
+  if (texto === "cancelar" || texto === "sair") {
+    estado.etapa = 'inicio'
+    estado.servico = undefined
+    estado.dia = undefined
+    estado.barbeiro = undefined
+    estado.horario = undefined
+    return "✅ Agendamento cancelado. Digite *AGENDAR* para começar!"
+  }
+
+  if (texto === "menu" || texto === "inicio") {
+    estado.etapa = 'inicio'
+    return "Digite *AGENDAR* para começar!"
+  }
+
+  // FLUXO
+  switch (estado.etapa) {
+    case 'inicio':
+      if (texto.toLowerCase() === "agendar") {
+        estado.etapa = 'servico'
+        return enviarMenuServicos()
+      }
+      return "Digite *AGENDAR* para começar!"
+
+    case 'servico':
+      const servico = SERVICOS_MOCK.find(s => s.id === texto || s.name.toLowerCase().includes(texto.toLowerCase()))
+      if (servico) {
+        estado.servico = servico
+        estado.etapa = 'dia'
+        return enviarMenuDias()
+      }
+      return "❓ Digite o NÚMERO do serviço (1 a 30) ou o NOME."
+
+    case 'dia':
+      if (texto.toLowerCase() === "hoje" || texto.toLowerCase() === "amanha" || texto.match(/\d{2}\/\d{2}/)) {
+        estado.dia = texto.toLowerCase() === "hoje" ? "hoje" : texto.toLowerCase() === "amanha" ? "amanhã" : texto
+        estado.etapa = 'barbeiro'
+        estado.paginaBarbeiros = 1
+        return enviarListaBarbeiros(estado.paginaBarbeiros)
+      }
+      return "❓ Escolha: *HOJE*, *AMANHÃ* ou uma data (ex: 15/04)"
+
+    case 'barbeiro':
+      if (texto.toLowerCase() === "proximo") {
+        const totalPaginas = Math.ceil(BARBEIROS_MOCK.length / 10)
+        if (estado.paginaBarbeiros < totalPaginas) {
+          estado.paginaBarbeiros++
+          return enviarListaBarbeiros(estado.paginaBarbeiros)
+        }
+        return "📋 Última página. Digite o NÚMERO do barbeiro."
+      }
+      
+      if (texto.toLowerCase() === "anterior") {
+        if (estado.paginaBarbeiros > 1) {
+          estado.paginaBarbeiros--
+          return enviarListaBarbeiros(estado.paginaBarbeiros)
+        }
+        return "📋 Primeira página."
+      }
+      
+      const barbeiro = BARBEIROS_MOCK.find(b => 
+        b.id === texto || 
+        b.name.toLowerCase().includes(texto.toLowerCase())
+      )
+      
+      if (barbeiro) {
+        estado.barbeiro = barbeiro
+        estado.etapa = 'horario'
+        return enviarMenuHorarios()
+      }
+      return "❓ Digite o NÚMERO ou NOME do barbeiro, ou PROXIMO para ver mais."
+
+    case 'horario':
+      const horarioMatch = texto.match(/(\d{1,2})[:h]?(\d{2})?/)
+      if (horarioMatch) {
+        const hora = horarioMatch[1].padStart(2, '0')
+        const minuto = horarioMatch[2] || "00"
+        estado.horario = `${hora}:${minuto}`
+        estado.etapa = 'confirmacao'
+        return mensagemConfirmacao(estado, nomeCliente)
+      }
+      return "❓ Digite um horário válido (ex: 14h, 14:30, 15)"
+
+    case 'confirmacao':
+      if (texto.toLowerCase() === "sim" || texto.toLowerCase() === "confirmar" || texto.toLowerCase() === "ok") {
+        const msg = `✅ *AGENDADO!*\n\n` +
+          `• Serviço: ${estado.servico?.name}\n` +
+          `• Valor: R$ ${estado.servico?.price}\n` +
+          `• Barbeiro: ${estado.barbeiro?.name} ⭐ ${estado.barbeiro?.rating}\n` +
+          `• Data: ${estado.dia}\n` +
+          `• Horário: ${estado.horario}\n\n` +
+          `Te esperamos! 💈`
+        
+        estado.etapa = 'inicio'
+        estado.servico = undefined
+        estado.dia = undefined
+        estado.barbeiro = undefined
+        estado.horario = undefined
+        
+        return msg
+      }
+      
+      if (texto.toLowerCase() === "nao" || texto.toLowerCase() === "cancelar") {
+        estado.etapa = 'servico'
+        estado.servico = undefined
+        return "🔄 Vamos recomeçar. Escolha um serviço (1 a 30):"
+      }
+      
+      return "❓ Confirme com *SIM* ou *NAO*"
+  }
+
+  return "Digite *AGENDAR* para começar!"
 }
 
 // ============================================
-// GERAÇÃO DE SLOTS DE HORÁRIO
+// MENSAGENS
 // ============================================
 
-async function gerarSlotsDisponiveis(
-  dados: DadosBarbearia,
-  estado: EstadoColeta,
-  barbeiroId: string
-): Promise<{ horarios: string[]; slotBarbeirosMap: Record<string, string[]> }> {
-  const duracaoMinutos = Number(estado.servico_escolhido!.duration_min) || 30
-
-  // Determina quais barbeiros considerar
-  const barbeirosConsiderar =
-    barbeiroId === "sem_preferencia"
-      ? (estado.barbeiros_disponiveis || [])
-      : (estado.barbeiros_disponiveis || []).filter((b) => b.id === barbeiroId)
-
-  // Para cada barbeiro, gera slots de acordo com disponibilidade no dia
-  const slotBarbeirosMap: Record<string, string[]> = {}
-
-  for (const b of barbeirosConsiderar) {
-    const barbeiroFull = dados.barbeiros.find((bf) => bf.id === b.id)
-    if (!barbeiroFull) continue
-
-    const periodos = barbeiroFull.availability.filter(
-      (a) => a.day_of_week === estado.dia_semana && !a.is_day_off
-    )
-
-    const slotsDodia: string[] = []
-    for (const periodo of periodos) {
-      const slots = gerarSlotsIntervalo(periodo.starts_at, periodo.ends_at, duracaoMinutos)
-      slotsDodia.push(...slots)
-    }
-
-    // Filtra horários já ocupados no banco
-    const slotsLivres = await filtrarHorariosOcupados(
-      dados.barbershop_id,
-      b.id,
-      estado.dia_escolhido!,
-      slotsDodia,
-      duracaoMinutos
-    )
-
-    for (const slot of slotsLivres) {
-      if (!slotBarbeirosMap[slot]) slotBarbeirosMap[slot] = []
-      slotBarbeirosMap[slot].push(b.id)
-    }
-  }
-
-  // Ordena os slots cronologicamente
-  const horarios = Object.keys(slotBarbeirosMap).sort()
-  return { horarios, slotBarbeirosMap }
-}
-
-function gerarSlotsIntervalo(
-  horaInicio: string,
-  horaFim: string,
-  duracaoMinutos: number
-): string[] {
-  if (!horaInicio || !horaFim) return []
-
-  const [hI, mI] = horaInicio.split(":").map(Number)
-  const [hF, mF] = horaFim.split(":").map(Number)
-
-  if ([hI, mI, hF, mF].some(isNaN)) return []
-
-  const slots: string[] = []
-  let atual = new Date(2000, 0, 1, hI, mI)
-  const fim = new Date(2000, 0, 1, hF, mF)
-
-  while (atual < fim) {
-    slots.push(
-      `${String(atual.getHours()).padStart(2, "0")}:${String(atual.getMinutes()).padStart(2, "0")}`
-    )
-    atual = new Date(atual.getTime() + duracaoMinutos * 60000)
-  }
-
-  return slots
-}
-
-async function filtrarHorariosOcupados(
-  barbershopId: string,
-  barberId: string,
-  data: string,
-  slots: string[],
-  duracaoMinutos: number
-): Promise<string[]> {
-  const { data: agendamentos } = await supabase
-    .from("appointments")
-    .select("starts_at, ends_at")
-    .eq("barbershop_id", barbershopId)
-    .eq("barber_id", barberId)
-    .gte("starts_at", `${data}T00:00:00`)
-    .lte("starts_at", `${data}T23:59:59`)
-    .neq("status", "cancelled")
-
-  if (!agendamentos?.length) return slots
-
-  return slots.filter((slot) => {
-    const slotInicio = new Date(`${data}T${slot}:00`)
-    const slotFim = new Date(slotInicio.getTime() + duracaoMinutos * 60000)
-
-    return !agendamentos.some((a) => {
-      const aInicio = new Date(a.starts_at)
-      const aFim = new Date(a.ends_at)
-      return slotInicio < aFim && slotFim > aInicio
-    })
+function enviarMenuServicos(): string {
+  let msg = `✂️ *SERVIÇOS (1 a 30)*\n\n`
+  SERVICOS_MOCK.slice(0, 15).forEach((s) => {
+    msg += `• ${s.id}️⃣ ${s.name} - R$ ${s.price}\n`
   })
+  msg += `\n📋 Serviços 16 a 30 também disponíveis\n`
+  msg += `\nDigite o *NÚMERO* do serviço.\n\n_Digite CANCELAR_`
+  return msg
+}
+
+function enviarMenuDias(): string {
+  return `📅 *QUAL DIA?*\n\n` +
+    `Digite: HOJE, AMANHÃ ou DATA (ex: 15/04)\n\n` +
+    `_Digite CANCELAR_`
+}
+
+function enviarListaBarbeiros(pagina: number): string {
+  const itensPorPagina = 10
+  const inicio = (pagina - 1) * itensPorPagina
+  const barbeirosPagina = BARBEIROS_MOCK.slice(inicio, inicio + itensPorPagina)
+  const totalPaginas = Math.ceil(BARBEIROS_MOCK.length / itensPorPagina)
+  
+  let msg = `👨‍🦱 *BARBEIROS (Pág ${pagina}/${totalPaginas})*\n\n`
+  
+  barbeirosPagina.forEach((b) => {
+    const estrelas = "⭐".repeat(Math.floor(b.rating))
+    msg += `• ${b.id} - ${b.name} ${estrelas}\n  └ ${b.especialidade}\n\n`
+  })
+  
+  if (totalPaginas > 1) {
+    msg += `Digite PROXIMO ou ANTERIOR\n`
+  }
+  msg += `\nDigite o NÚMERO ou NOME do barbeiro.\n\n_Digite CANCELAR_`
+  return msg
+}
+
+function enviarMenuHorarios(): string {
+  return `⏰ *QUAL HORÁRIO?*\n\n` +
+    `Funcionamento: 08:00 às 20:00\n\n` +
+    `Digite o horário (ex: 14h, 14:30, 15)\n\n` +
+    `_Digite CANCELAR_`
+}
+
+function mensagemConfirmacao(estado: EstadoTeste, nomeCliente: string): string {
+  return `📋 *CONFIRMAR*\n\n` +
+    `👤 ${nomeCliente}\n` +
+    `✂️ ${estado.servico?.name} - R$ ${estado.servico?.price}\n` +
+    `👨‍🦱 ${estado.barbeiro?.name} ⭐ ${estado.barbeiro?.rating}\n` +
+    `📅 ${estado.dia} às ${estado.horario}\n\n` +
+    `Digite *SIM* ou *NAO*`
 }
 
 // ============================================
-// CRIAÇÃO DO AGENDAMENTO
+// ENVIOS WHATSAPP
 // ============================================
 
-async function criarAgendamento(
-  dados: DadosBarbearia,
-  estado: EstadoColeta,
-  nomeCliente: string,
-  clienteTelefone: string
-): Promise<{ success: boolean; error?: string; barbeiroNome?: string }> {
-  try {
-    const servico = estado.servico_escolhido!
-    const dia = estado.dia_escolhido!
-    const hora = estado.horario_escolhido!
-    const duracaoMinutos = Number(servico.duration_min) || 30
+async function enviarBotoesIniciais(phoneNumberId: string, nomeBarbearia: string, to: string, nomeCliente: string): Promise<void> {
+  const token = Deno.env.get("WHATSAPP_TOKEN")
+  if (!token) return
 
-    // Define barbeiro efetivo
-    let barbeiroId: string
-    let barbeiroNome: string
-
-    if (estado.barbeiro_escolhido!.id === "sem_preferencia") {
-      const barbeirosDisponiveis = estado.slot_barbeiros_map?.[hora] || []
-      if (!barbeirosDisponiveis.length) {
-        return { success: false, error: "Horário não está mais disponível. Por favor, escolha outro." }
+  const payload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: `👋 Olá ${nomeCliente}! Bem-vindo à ${nomeBarbearia}!\n\nO que você gostaria de fazer?` },
+      action: {
+        buttons: [
+          { type: "reply", reply: { id: "acao_agendar", title: "📅 AGENDAR" } },
+          { type: "reply", reply: { id: "acao_meus_agendamentos", title: "📋 MEUS AGENDAMENTOS" } },
+          { type: "reply", reply: { id: "acao_informacoes", title: "ℹ️ INFORMAÇÕES" } }
+        ]
       }
-      const escolhido = await escolherMelhorBarbeiro(dados.barbershop_id, barbeirosDisponiveis, dia)
-      barbeiroId = escolhido.id
-      barbeiroNome = dados.barbeiros.find((b) => b.id === escolhido.id)?.name || "Barbeiro"
-    } else {
-      barbeiroId = estado.barbeiro_escolhido!.id
-      barbeiroNome = estado.barbeiro_escolhido!.name
     }
-
-    // Verifica se o slot ainda está disponível (evita race condition)
-    const slotsLivres = await filtrarHorariosOcupados(
-      dados.barbershop_id,
-      barbeiroId,
-      dia,
-      [hora],
-      duracaoMinutos
-    )
-
-    if (!slotsLivres.includes(hora)) {
-      return {
-        success: false,
-        error: "Este horário acabou de ser ocupado. Por favor, escolha outro horário.",
-      }
-    }
-
-    // Busca ou cria cliente na tabela customers (usando telefone do WhatsApp)
-    const manualCustomerId = await buscarOuCriarClienteManual(
-      dados.barbershop_id,
-      nomeCliente,
-      clienteTelefone
-    )
-
-    const startsAt = new Date(`${dia}T${hora}:00`)
-    const endsAt = new Date(startsAt.getTime() + duracaoMinutos * 60000)
-
-    const { error } = await supabase.from("appointments").insert({
-      barbershop_id: dados.barbershop_id,
-      barber_id: barbeiroId,
-      service_id: servico.id,
-      manual_customer_id: manualCustomerId || null,
-      service_name: servico.name,
-      service_price: servico.price,
-      service_duration: duracaoMinutos,
-      barber_name: barbeiroNome,
-      customer_name: nomeCliente,
-      starts_at: startsAt.toISOString(),
-      ends_at: endsAt.toISOString(),
-      status: "scheduled",
-    })
-
-    if (error) {
-      console.error("[ERRO] Inserir agendamento:", error)
-      return { success: false, error: "Não foi possível salvar o agendamento no sistema." }
-    }
-
-    console.log(`[AGENDAMENTO] Criado: ${servico.name} com ${barbeiroNome} em ${dia} ${hora} para ${nomeCliente}`)
-    return { success: true, barbeiroNome }
-  } catch (err) {
-    console.error("[ERRO] criarAgendamento:", err)
-    return { success: false, error: "Erro inesperado ao criar agendamento." }
-  }
-}
-
-async function buscarOuCriarClienteManual(
-  barbershopId: string,
-  nomeCliente: string,
-  telefone: string
-): Promise<string | null> {
-  // Tenta encontrar cliente existente pelo telefone
-  const { data: existente } = await supabase
-    .from("customers")
-    .select("id")
-    .eq("barbershop_id", barbershopId)
-    .eq("phone", telefone)
-    .single()
-
-  if (existente) return existente.id
-
-  // Cria novo cliente
-  const { data: novo, error } = await supabase
-    .from("customers")
-    .insert({ barbershop_id: barbershopId, name: nomeCliente, phone: telefone })
-    .select("id")
-    .single()
-
-  if (error) {
-    console.error("[ERRO] buscarOuCriarClienteManual:", error)
-    return null
-  }
-
-  return novo?.id || null
-}
-
-async function escolherMelhorBarbeiro(
-  barbershopId: string,
-  barbeirosIds: string[],
-  dia: string
-): Promise<{ id: string }> {
-  // Conta agendamentos de cada barbeiro no dia e escolhe o com menos
-  const contagemPorBarbeiro: Record<string, number> = {}
-  for (const id of barbeirosIds) {
-    contagemPorBarbeiro[id] = 0
-  }
-
-  const { data: agendamentos } = await supabase
-    .from("appointments")
-    .select("barber_id")
-    .eq("barbershop_id", barbershopId)
-    .in("barber_id", barbeirosIds)
-    .gte("starts_at", `${dia}T00:00:00`)
-    .lte("starts_at", `${dia}T23:59:59`)
-    .neq("status", "cancelled")
-
-  for (const a of agendamentos || []) {
-    if (a.barber_id in contagemPorBarbeiro) {
-      contagemPorBarbeiro[a.barber_id]++
-    }
-  }
-
-  const melhor = Object.entries(contagemPorBarbeiro).sort(([, a], [, b]) => a - b)[0]
-  return { id: melhor[0] }
-}
-
-// ============================================
-// HAIKU — LINGUAGEM NATURAL
-// ============================================
-
-async function haikuBoasVindas(
-  dados: DadosBarbearia,
-  nomeCliente: string,
-  historico: any[]
-): Promise<string> {
-  const lista = dados.servicos
-    .map((s) => {
-      const preco = s.price ? ` — R$ ${Number(s.price).toFixed(2).replace(".", ",")}` : ""
-      const duracao = s.duration_min ? ` (${s.duration_min}min)` : ""
-      return `• ${s.name}${preco}${duracao}`
-    })
-    .join("\n")
-
-  const system = `Você é o assistente virtual da barbearia *${dados.barbershop_name}*.
-Sua missão: recepcionar o cliente de forma calorosa e objetiva, e apresentar os serviços disponíveis.
-
-Regras:
-- Cumprimente pelo nome: ${nomeCliente}
-- Use linguagem natural, informal e simpática (português brasileiro)
-- Apresente a lista de serviços abaixo exatamente como fornecida
-- Finalize perguntando qual serviço o cliente deseja
-- Máximo 5 linhas no total (sem contar a lista)
-
-Serviços disponíveis:
-${lista}`
-
-  const msgs = historico.filter((h) => h.role === "user" || h.role === "assistant").slice(-4)
-  const messages = msgs.length > 0 ? msgs : [{ role: "user", content: `Oi, meu nome é ${nomeCliente}` }]
-
-  return await chamarHaiku(system, messages, 350)
-}
-
-async function haikuContexto(
-  dados: DadosBarbearia,
-  nomeCliente: string,
-  instrucao: string,
-  historico: any[]
-): Promise<string> {
-  const lista = dados.servicos.map((s) => `• ${s.name}`).join("\n")
-
-  const system = `Você é o assistente virtual da barbearia *${dados.barbershop_name}*.
-Cliente: ${nomeCliente}
-
-Serviços disponíveis:
-${lista}
-
-Regras:
-- Linguagem informal, amigável, objetiva
-- Máximo 3 frases
-
-Instrução atual: ${instrucao}`
-
-  const mensagensAnteriores = historico
-    .filter((h) => h.role === "user" || h.role === "assistant")
-    .slice(-6)
-
-  return await chamarHaiku(system, mensagensAnteriores, 250)
-}
-
-async function interpretarEscolhaHaiku(
-  texto: string,
-  opcoes: Array<{ id: string; name: string }>,
-  tipo: string
-): Promise<string | null> {
-  if (!opcoes.length) return null
-
-  const lista = opcoes.map((o, i) => `${i + 1}. ${o.name} [id:${o.id}]`).join("\n")
-
-  const system = `Você identifica qual opção o cliente escolheu com base no texto dele.
-Responda APENAS com o ID exato (entre colchetes) da opção identificada, ou a palavra "nenhum" se não for possível identificar.
-Sem explicações. Sem pontuação extra.`
-
-  const userMsg = `Opções de ${tipo}:\n${lista}\n\nO cliente disse: "${texto}"\n\nQual ${tipo} o cliente escolheu?`
-
-  const resposta = await chamarHaiku(system, [{ role: "user", content: userMsg }], 60)
-  const trimmed = resposta.trim()
-
-  if (trimmed === "nenhum") return null
-
-  // Extrai ID retornado
-  const encontrado = opcoes.find(
-    (o) => o.id === trimmed || trimmed.includes(o.id) || normalizar(trimmed) === normalizar(o.name)
-  )
-
-  return encontrado?.id || null
-}
-
-async function chamarHaiku(
-  system: string,
-  messages: any[],
-  maxTokens: number
-): Promise<string> {
-  if (!ANTHROPIC_API_KEY) {
-    return "Desculpe, erro de configuração técnica."
   }
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "prompt-caching-2024-07-31",
-      },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    const result = await response.json()
+    if (result.error) console.error("[ERRO] botão:", JSON.stringify(result.error))
+    else console.log("[BOTÕES] Enviados com sucesso")
+  } catch (err) {
+    console.error("[ERRO] enviarBotoesIniciais:", err)
+  }
+}
+
+async function enviarWhatsApp(phoneNumberId: string, to: string, texto: string): Promise<void> {
+  const token = Deno.env.get("WHATSAPP_TOKEN")
+  if (!token) return
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: maxTokens,
-        system,
-        messages,
+        messaging_product: "whatsapp",
+        to: to,
+        type: "text",
+        text: { body: texto },
       }),
     })
-
-    const data = await response.json()
-
-    if (data.usage) {
-      console.log(
-        `[CACHE] write:${data.usage.cache_creation_input_tokens || 0} read:${data.usage.cache_read_input_tokens || 0} in:${data.usage.input_tokens} out:${data.usage.output_tokens}`
-      )
-    }
-
-    return data.content?.[0]?.text?.trim() || ""
-  } catch (err) {
-    console.error("[ERRO] chamarHaiku:", err)
-    return ""
-  }
-}
-
-// ============================================
-// ENVIO WHATSAPP
-// ============================================
-
-async function enviarWhatsApp(
-  phoneNumberId: string,
-  to: string,
-  texto: string
-): Promise<void> {
-  const token = Deno.env.get("WHATSAPP_TOKEN")
-  if (!token) {
-    console.error("[ERRO] WHATSAPP_TOKEN não configurado")
-    return
-  }
-
-  try {
-    const response = await fetch(
-      `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to,
-          type: "text",
-          text: { body: texto },
-        }),
-      }
-    )
     const result = await response.json()
-    if (result.error) {
-      console.error("[ERRO] enviarWhatsApp:", JSON.stringify(result.error))
-    }
+    if (result.error) console.error("[ERRO] enviarWhatsApp:", JSON.stringify(result.error))
   } catch (err) {
     console.error("[ERRO] enviarWhatsApp:", err)
   }
-}
-
-// ============================================
-// MENSAGEM DE RESUMO
-// ============================================
-
-function montarResumoAgendamento(estado: EstadoColeta): string {
-  const servico = estado.servico_escolhido!
-  const barbeiro = estado.barbeiro_escolhido!
-  const preco = servico.price
-    ? `R$ ${Number(servico.price).toFixed(2).replace(".", ",")}`
-    : "Consultar"
-  const dataFormatada = formatarDataExibicao(estado.dia_escolhido!)
-
-  return `📋 *Resumo do agendamento:*\n\n• Serviço: ${servico.name} (${preco})\n• Barbeiro: ${barbeiro.name}\n• Data: ${dataFormatada}\n• Horário: ${estado.horario_escolhido}\n\nPosso confirmar seu agendamento?`
-}
-
-// ============================================
-// UTILITÁRIOS DE DATA/HORA
-// ============================================
-
-function parsearDia(texto: string): { data: string; diaSemana: number; label: string } | null {
-  const n = normalizar(texto)
-  const hoje = new Date()
-
-  if (n.match(/\bhoje\b/)) {
-    return { data: isoDate(hoje), diaSemana: hoje.getDay(), label: "hoje" }
-  }
-
-  if (n.match(/\bamanha\b|\bamanh[aã]\b/)) {
-    const amanha = addDays(hoje, 1)
-    return { data: isoDate(amanha), diaSemana: amanha.getDay(), label: "amanhã" }
-  }
-
-  const mapeamento = [
-    { regex: /\bdom(ingo)?\b/, dia: 0, label: "domingo" },
-    { regex: /\bseg(unda)?\b/, dia: 1, label: "segunda" },
-    { regex: /\bter(ca|ça)?\b/, dia: 2, label: "terça" },
-    { regex: /\bqua(rta)?\b/, dia: 3, label: "quarta" },
-    { regex: /\bqui(nta)?\b/, dia: 4, label: "quinta" },
-    { regex: /\bsex(ta)?\b/, dia: 5, label: "sexta" },
-    { regex: /\bsab(ado|ábado)?\b/, dia: 6, label: "sábado" },
-  ]
-
-  for (const m of mapeamento) {
-    if (n.match(m.regex)) {
-      const data = proximoDiaSemana(m.dia)
-      return { data: isoDate(data), diaSemana: m.dia, label: m.label }
-    }
-  }
-
-  // DD/MM ou DD/MM/YYYY
-  const matchData = texto.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?/)
-  if (matchData) {
-    const d = parseInt(matchData[1])
-    const mo = parseInt(matchData[2]) - 1
-    const a = matchData[3] ? parseInt(matchData[3]) : hoje.getFullYear()
-    const data = new Date(a, mo, d)
-    const nomesDias = ["domingo", "segunda", "terça", "quarta", "quinta", "sexta", "sábado"]
-    return {
-      data: isoDate(data),
-      diaSemana: data.getDay(),
-      label: `${nomesDias[data.getDay()]}, ${d.toString().padStart(2, "0")}/${(mo + 1).toString().padStart(2, "0")}`,
-    }
-  }
-
-  return null
-}
-
-function parsearHorario(texto: string, disponiveis: string[]): string | null {
-  const n = normalizar(texto)
-
-  // Primeiro verifica se digitou número de opção (ex: "1", "2")
-  const numMatch = n.match(/^(\d+)$/)
-  if (numMatch) {
-    const idx = parseInt(numMatch[1]) - 1
-    if (idx >= 0 && idx < disponiveis.length) {
-      return disponiveis[idx]
-    }
-  }
-
-  // Tenta encontrar o horário no texto
-  for (const h of disponiveis) {
-    const semColon = h.replace(":", "")
-    const comH = h.split(":")[0] + "h"
-    const comHMin = h.split(":")[0] + "h" + h.split(":")[1]
-
-    if (
-      n.includes(h) ||
-      n.includes(semColon) ||
-      n.includes(comH) ||
-      n.includes(comHMin) ||
-      n.includes(h.split(":")[0] + " horas")
-    ) {
-      return h
-    }
-  }
-
-  return null
-}
-
-function proximoDiaSemana(dia: number): Date {
-  const hoje = new Date()
-  const diff = dia - hoje.getDay()
-  return addDays(hoje, diff <= 0 ? diff + 7 : diff)
-}
-
-function addDays(data: Date, dias: number): Date {
-  const d = new Date(data)
-  d.setDate(d.getDate() + dias)
-  return d
-}
-
-function isoDate(d: Date): string {
-  return d.toISOString().split("T")[0]
-}
-
-function formatarDataExibicao(isoDate: string): string {
-  const [ano, mes, dia] = isoDate.split("-").map(Number)
-  const d = new Date(ano, mes - 1, dia)
-  const nomes = ["domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"]
-  return `${nomes[d.getDay()]}, ${dia.toString().padStart(2, "0")}/${mes.toString().padStart(2, "0")}/${ano}`
-}
-
-function normalizar(texto: string): string {
-  return texto
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .trim()
 }
