@@ -771,64 +771,67 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "jsr:@supabase/supabase-js@2"
 
 const VERIFY_TOKEN = "virtual_barber_webhook_2026"
-const BARBERSHOP_TEST_ID = Deno.env.get("BARBERSHOP_TEST_ID") || ""
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 )
 
 // ============================================
-// CACHE DE DADOS DA BARBEARIA (carregado uma vez por worker)
+// LOOKUP: phoneNumberId → barbershop
 // ============================================
-let BARBERSHOP_NAME_CACHE: string | null = null
 
-async function getNomeBarbearia(): Promise<string> {
-  if (BARBERSHOP_NAME_CACHE) return BARBERSHOP_NAME_CACHE
-  const { data } = await supabase
+interface BarbershopInfo {
+  id: string
+  name: string
+}
+
+const CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutos
+
+const BARBERSHOP_CACHE = new Map<string, { data: BarbershopInfo; at: number }>()
+
+async function getBarbershopByPhone(phoneNumberId: string): Promise<BarbershopInfo | null> {
+  const cached = BARBERSHOP_CACHE.get(phoneNumberId)
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
+  const { data, error } = await supabase
     .from("barbershops")
-    .select("name")
-    .eq("id", BARBERSHOP_TEST_ID)
+    .select("id, name")
+    .eq("whatsapp_phone_number_id", phoneNumberId)
     .single()
-  BARBERSHOP_NAME_CACHE = data?.name || "Barbearia"
-  return BARBERSHOP_NAME_CACHE
+  if (error || !data) {
+    console.error("[ERRO] getBarbershopByPhone:", phoneNumberId, JSON.stringify(error))
+    return null
+  }
+  BARBERSHOP_CACHE.set(phoneNumberId, { data: data as BarbershopInfo, at: Date.now() })
+  return data as BarbershopInfo
 }
 
 // ============================================
-// DADOS MOCKADOS
+// SERVIÇOS (cache por barbearia)
 // ============================================
 
-const SERVICOS_MOCK = [
-  { id: "1", name: "✂️ Corte Tradicional", price: 35, duration: 30 },
-  { id: "2", name: "✂️ Corte Degradê", price: 45, duration: 40 },
-  { id: "3", name: "✂️ Corte Social", price: 40, duration: 35 },
-  { id: "4", name: "✂️ Corte Americano", price: 50, duration: 45 },
-  { id: "5", name: "✂️ Corte Militar", price: 30, duration: 25 },
-  { id: "6", name: "✂️ Corte UnderCut", price: 55, duration: 50 },
-  { id: "7", name: "✂️ Corte Moicano", price: 45, duration: 40 },
-  { id: "8", name: "✂️ Corte com Máquina", price: 35, duration: 30 },
-  { id: "9", name: "✂️ Corte na Tesoura", price: 50, duration: 45 },
-  { id: "10", name: "🧔 Barba Completa", price: 30, duration: 25 },
-  { id: "11", name: "🧔 Barba Desenhada", price: 35, duration: 30 },
-  { id: "12", name: "🧔 Barba com Navalha", price: 40, duration: 35 },
-  { id: "13", name: "🧔 Aparar Barba", price: 20, duration: 15 },
-  { id: "14", name: "🧔 Sobrancelha", price: 15, duration: 10 },
-  { id: "15", name: "🧔 Pigmentação de Barba", price: 80, duration: 60 },
-  { id: "16", name: "💈 Corte + Barba", price: 60, duration: 50 },
-  { id: "17", name: "💈 Corte + Sobrancelha", price: 45, duration: 40 },
-  { id: "18", name: "💈 Barba + Sobrancelha", price: 40, duration: 35 },
-  { id: "19", name: "💈 Combo Premium", price: 90, duration: 75 },
-  { id: "20", name: "🎨 Platinado", price: 150, duration: 120 },
-  { id: "21", name: "🎨 Luzes", price: 120, duration: 90 },
-  { id: "22", name: "🎨 Coloração", price: 100, duration: 75 },
-  { id: "23", name: "🎨 Mechas", price: 130, duration: 100 },
-  { id: "24", name: "💆 Terapia Capilar", price: 70, duration: 45 },
-  { id: "25", name: "💆 Hidratação", price: 50, duration: 35 },
-  { id: "26", name: "💆 Alisamento", price: 120, duration: 90 },
-  { id: "27", name: "👦 Corte Infantil", price: 30, duration: 25 },
-  { id: "28", name: "👨‍🦳 Corte Sênior", price: 35, duration: 30 },
-  { id: "29", name: "🎭 Design de Barba", price: 45, duration: 40 },
-  { id: "30", name: "✨ Finalização", price: 20, duration: 15 }
-]
+interface Servico {
+  id: string
+  name: string
+  price: number
+  duration_min: number
+}
+
+const SERVICOS_CACHE = new Map<string, { data: Servico[]; at: number }>()
+
+async function getServicos(barbershopId: string): Promise<Servico[]> {
+  const cached = SERVICOS_CACHE.get(barbershopId)
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
+  const { data, error } = await supabase
+    .from("services")
+    .select("id, name, price, duration_min")
+    .eq("barbershop_id", barbershopId)
+    .eq("is_active", true)
+    .order("name")
+  if (error) console.error("[ERRO] getServicos:", JSON.stringify(error))
+  const servicos = (data || []) as Servico[]
+  SERVICOS_CACHE.set(barbershopId, { data: servicos, at: Date.now() })
+  return servicos
+}
 
 const BARBEIROS_MOCK = [
   { id: "1", name: "Carlos", rating: 4.9, especialidade: "Degradê" },
@@ -855,7 +858,7 @@ const BARBEIROS_MOCK = [
 
 interface EstadoTeste {
   etapa: 'inicio' | 'servico' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao' | 'informacoes' | 'listar_agendamentos'
-  servico?: typeof SERVICOS_MOCK[0]
+  servico?: Servico
   dia?: string
   barbeiro?: typeof BARBEIROS_MOCK[0]
   horario?: string
@@ -894,30 +897,37 @@ Deno.serve(async (req) => {
         return new Response("OK", { status: 200 })
       }
 
-      const nomeBarbearia = await getNomeBarbearia()
-
       const msg = value.messages[0] //OBJETO DA MENSAGEM DO CLIENTE
       const from = msg.from //NUMERO DO CLIENTE
       const phoneNumberId = value.metadata?.phone_number_id || value.phone_number_id //ID DO WHATSAPP DA BARBEARIA
       const nomeCliente = value.contacts?.[0]?.profile?.name || "Cliente" //NOME DO CLIENTE
 
+      // IDENTIFICA A BARBEARIA PELO phoneNumberId
+      const barbearia = await getBarbershopByPhone(phoneNumberId)
+      if (!barbearia) {
+        console.error(`[ERRO] Barbearia não encontrada para phoneNumberId: ${phoneNumberId}`)
+        return new Response("OK", { status: 200 })
+      }
+      const barbershopId = barbearia.id
+      const nomeBarbearia = barbearia.name
+
       let texto = msg.text?.body?.trim() || ""
-      
+
       //DETECTA SE É INTERAÇÃO (clique em botão ou lista)
       const isInteractive = msg.type === "interactive"
 
       //SE FOR INTERAÇÃO, PEGA O ID DO BOTÃO CLICADO OU OPÇÃO DE LISTA, CASO EXISTA
       if (isInteractive) {
-        texto = msg.interactive?.button_reply?.id || 
-                msg.interactive?.list_reply?.id || 
+        texto = msg.interactive?.button_reply?.id ||
+                msg.interactive?.list_reply?.id ||
                 texto
       }
 
-      console.log(`[MSG] ${nomeCliente}: "${texto}" | tipo: ${msg.type}`)
+      console.log(`[MSG] ${nomeCliente}: "${texto}" | tipo: ${msg.type} | barbearia: ${nomeBarbearia}`)
 
       // BUSCA O ESTADO DA CONVERSA NA TABELA conversations_chatbot DO BANCO DE DADOS
       let estado = await buscarEstadoConversa(from)
-      
+
       console.log(`[ESTADO] etapa: ${estado.etapa}, jaEnviouBoasVindas: ${estado.jaEnviouBoasVindas}`)
 
       // SÓ ENVIA BOAS-VINDAS SE:
@@ -926,10 +936,10 @@ Deno.serve(async (req) => {
       if (!estado.jaEnviouBoasVindas && !isInteractive) {
         console.log(`[ENVIO] Primeira interação - enviando botão`)
         await enviarBotoesIniciais(phoneNumberId, nomeBarbearia, from, nomeCliente)
-        
+
         estado.jaEnviouBoasVindas = true
         estado.etapa = 'inicio'
-        await salvarEstadoConversa(from, estado, phoneNumberId)
+        await salvarEstadoConversa(from, estado, phoneNumberId, barbershopId)
         return new Response("OK", { status: 200 })
       }
 
@@ -940,10 +950,10 @@ Deno.serve(async (req) => {
       }
 
       // Processa resposta
-      const resposta = await processarComBotoes(texto, nomeCliente, estado, phoneNumberId, from)
+      const resposta = await processarComBotoes(texto, nomeCliente, estado, phoneNumberId, from, barbershopId)
 
       // Salva estado atualizado
-      await salvarEstadoConversa(from, estado, phoneNumberId)
+      await salvarEstadoConversa(from, estado, phoneNumberId, barbershopId)
 
       // Envia resposta se houver
       if (resposta) {
@@ -976,7 +986,8 @@ async function buscarEstadoConversa(clienteNumero: string): Promise<EstadoTeste>
     .single()
 
   if (data?.historic && data.historic.length > 0) {
-    const ultimoEstado = data.historic.find((h: any) => h.tipo === "estado_teste")
+    // 🔥 CORREÇÃO: busca do FIM para o INÍCIO (estado mais recente)
+    const ultimoEstado = [...data.historic].reverse().find((h: any) => h.tipo === "estado_teste")
     if (ultimoEstado) {
       return ultimoEstado.content as EstadoTeste
     }
@@ -985,7 +996,7 @@ async function buscarEstadoConversa(clienteNumero: string): Promise<EstadoTeste>
   return { etapa: 'inicio', paginaBarbeiros: 1, jaEnviouBoasVindas: false }
 }
 
-async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, phoneNumberId: string): Promise<void> {
+async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, phoneNumberId: string, barbershopId: string): Promise<void> {
   const { data: conversa } = await supabase
     .from("conversations_chatbot")
     .select("id, historic")
@@ -997,6 +1008,7 @@ async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, 
 
   if (conversa) {
     const historic = conversa.historic || []
+    // REMOVE todos os estados antigos, mantém apenas o novo
     const outrosHistoricos = historic.filter((h: any) => h.tipo !== "estado_teste")
     const novoHistorico = [...outrosHistoricos, { role: "system", tipo: "estado_teste", content: estado }]
 
@@ -1009,7 +1021,7 @@ async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, 
     const { error } = await supabase
       .from("conversations_chatbot")
       .insert({
-        barbershop_id: BARBERSHOP_TEST_ID,
+        barbershop_id: barbershopId,
         barbershop_phone_number_id: phoneNumberId,
         client_phone_number_id: clienteNumero,
         historic: [{ role: "system", tipo: "estado_teste", content: estado }],
@@ -1027,27 +1039,28 @@ async function processarComBotoes(
   nomeCliente: string,
   estado: EstadoTeste,
   phoneNumberId: string,
-  from: string
+  from: string,
+  barbershopId: string
 ): Promise<string | null> {
-  
+
   // CLIQUE NO BOTÃO AGENDAR
   if (texto === "acao_agendar") {
     estado.etapa = 'servico'
-    return enviarMenuServicos()
+    return await enviarMenuServicos(barbershopId)
   }
 
   // CLIQUE NO BOTÃO MEUS AGENDAMENTOS
   if (texto === "acao_meus_agendamentos") {
     estado.etapa = 'listar_agendamentos'
-    return enviarMenuServicos()
+    return await enviarMenuServicos(barbershopId)
   }
 
   //CLIQUE NO BOTÃO INFORMAÇÕES
   if (texto === "acao_informacoes") {
     estado.etapa = 'informacoes'
-    return enviarMenuServicos()
+    return await enviarMenuServicos(barbershopId)
   }
-
+  console.log("[CHAMOU processarComBotoes]", { texto, etapa: estado.etapa })
   // COMANDOS
   if (texto === "cancelar" || texto === "sair") {
     estado.etapa = 'inicio'
@@ -1068,20 +1081,26 @@ async function processarComBotoes(
     case 'inicio':
       if (texto.toLowerCase() === "agendar") {
         estado.etapa = 'servico'
-        return enviarMenuServicos()
+        return await enviarMenuServicos(barbershopId)
       }
-      await enviarBotoesIniciais(phoneNumberId, BARBERSHOP_NAME_CACHE ?? "Barbearia", from, nomeCliente, "Pra gente seguir com teu agendamento é só clicar em uma das opções abaixo 😊")
+      await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente, "Pra gente seguir com teu agendamento é só clicar em uma das opções abaixo 😊")
       return null
 
-    case 'servico':
-      const servico = SERVICOS_MOCK.find(s => s.id === texto || s.name.toLowerCase().includes(texto.toLowerCase()))
-      if (servico) {
-        estado.servico = servico
+    case 'servico': {
+      const servicos = await getServicos(barbershopId)
+      const servicoEncontrado = servicos.find((s, i) =>
+        String(i + 1) === texto ||
+        s.id === texto ||
+        s.name.toLowerCase().includes(texto.toLowerCase())
+      )
+      if (servicoEncontrado) {
+        estado.servico = servicoEncontrado
         estado.etapa = 'dia'
         await enviarBotoesData(phoneNumberId, from, nomeCliente)
         return null
       }
-      return "❓ Digite o NÚMERO do serviço (1 a 30) ou o NOME."
+      return `❓ Digite o NÚMERO ou NOME do serviço. (${servicos.length} disponíveis)`
+    }
 
     case 'dia':
       if (texto === "dia_outra") {
@@ -1158,7 +1177,7 @@ async function processarComBotoes(
       if (texto.toLowerCase() === "nao" || texto.toLowerCase() === "cancelar") {
         estado.etapa = 'servico'
         estado.servico = undefined
-        return "🔄 Vamos recomeçar. Escolha um serviço (1 a 30):"
+        return await enviarMenuServicos(barbershopId)
       }
       
       return "❓ Confirme com *SIM* ou *NAO*"
@@ -1171,13 +1190,16 @@ async function processarComBotoes(
 // MENSAGENS
 // ============================================
 
-function enviarMenuServicos(): string {
-  let msg = `✂️ *SERVIÇOS (1 a 30)*\n\n`
-  SERVICOS_MOCK.slice(0, 15).forEach((s) => {
-    msg += `• ${s.id}️⃣ ${s.name} - R$ ${s.price}\n`
+async function enviarMenuServicos(barbershopId: string): Promise<string> {
+  const servicos = await getServicos(barbershopId)
+  if (servicos.length === 0) {
+    return "⚠️ Nenhum serviço disponível no momento. Tente novamente em breve."
+  }
+  let msg = `✂️ *SERVIÇOS DISPONÍVEIS (${servicos.length})*\n\n`
+  servicos.forEach((s, i) => {
+    msg += `• ${i + 1}. ${s.name} - R$ ${Number(s.price).toFixed(2)}\n`
   })
-  msg += `\n📋 Serviços 16 a 30 também disponíveis\n`
-  msg += `\nDigite o *NÚMERO* do serviço.\n\n_Digite CANCELAR_`
+  msg += `\nDigite o *NÚMERO* ou *NOME* do serviço.\n\n_Digite CANCELAR_`
   return msg
 }
 
