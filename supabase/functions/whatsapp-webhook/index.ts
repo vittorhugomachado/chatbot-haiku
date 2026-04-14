@@ -1047,19 +1047,39 @@ async function processarComBotoes(
   // CLIQUE NO BOTÃO AGENDAR
   if (texto === "acao_agendar") {
     estado.etapa = 'servico'
-    return await enviarMenuServicos(barbershopId)
+    await enviarMenuServicos(barbershopId, phoneNumberId, from)
+    return null
   }
 
   // CLIQUE NO BOTÃO MEUS AGENDAMENTOS
   if (texto === "acao_meus_agendamentos") {
     estado.etapa = 'listar_agendamentos'
-    return await enviarMenuServicos(barbershopId)
+    await enviarMenuServicos(barbershopId, phoneNumberId, from)
+    return null
   }
 
   //CLIQUE NO BOTÃO INFORMAÇÕES
   if (texto === "acao_informacoes") {
     estado.etapa = 'informacoes'
-    return await enviarMenuServicos(barbershopId)
+    await enviarMenuServicos(barbershopId, phoneNumberId, from)
+    return null
+  }
+
+  // BOTÃO VOLTAR → volta ao menu inicial
+  if (texto === "servico_voltar") {
+    estado.etapa = 'inicio'
+    await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
+    return null
+  }
+
+  // BOTÃO CANCELAR AGENDAMENTO
+  if (texto === "servico_cancelar") {
+    estado.etapa = 'inicio'
+    estado.servico = undefined
+    estado.dia = undefined
+    estado.barbeiro = undefined
+    estado.horario = undefined
+    return "✅ Agendamento cancelado!"
   }
   console.log("[CHAMOU processarComBotoes]", { texto, etapa: estado.etapa })
   // COMANDOS
@@ -1082,7 +1102,8 @@ async function processarComBotoes(
     case 'inicio':
       if (texto.toLowerCase() === "agendar") {
         estado.etapa = 'servico'
-        return await enviarMenuServicos(barbershopId)
+        await enviarMenuServicos(barbershopId, phoneNumberId, from)
+        return null
       }
       await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente, "Pra gente seguir com teu agendamento é só clicar em uma das opções abaixo 😊")
       return null
@@ -1178,7 +1199,8 @@ async function processarComBotoes(
       if (texto.toLowerCase() === "nao" || texto.toLowerCase() === "cancelar") {
         estado.etapa = 'servico'
         estado.servico = undefined
-        return await enviarMenuServicos(barbershopId)
+        await enviarMenuServicos(barbershopId, phoneNumberId, from)
+        return null
       }
       
       return "❓ Confirme com *SIM* ou *NAO*"
@@ -1191,11 +1213,13 @@ async function processarComBotoes(
 // MENSAGENS
 // ============================================
 
-async function enviarMenuServicos(barbershopId: string): Promise<string> {
+async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, to: string): Promise<void> {
   const servicos = await getServicos(barbershopId)
   if (servicos.length === 0) {
-    return "⚠️ Nenhum serviço disponível no momento. Tente novamente em breve."
+    await enviarWhatsApp(phoneNumberId, to, "⚠️ Nenhum serviço disponível no momento. Tente novamente em breve.")
+    return
   }
+
   let msg = `✂️ *SERVIÇOS DISPONÍVEIS (${servicos.length})*\n\n`
   servicos.forEach((s, i) => {
     msg += `*${i + 1}. ${s.name}* - R$ ${Number(s.price).toFixed(2).replace('.', ',')}\n`
@@ -1203,8 +1227,9 @@ async function enviarMenuServicos(barbershopId: string): Promise<string> {
     if (s.description) msg += `   _${s.description}_\n`
     msg += `\n`
   })
-    msg += `\nDigite o *NÚMERO* ou *NOME* do serviço.\n\nPara cancelar é só digitar _CANCELAR_`
-  return msg
+
+  await enviarWhatsApp(phoneNumberId, to, msg)
+  await enviarBotoesVoltarCancelar(phoneNumberId, to, "Digite o *NÚMERO* ou *NOME* do serviço acima")
 }
 
 function enviarMenuDias(): string {
@@ -1287,6 +1312,39 @@ async function enviarBotoesIniciais(phoneNumberId: string, nomeBarbearia: string
     else console.log("[BOTÕES] Enviados com sucesso")
   } catch (err) {
     console.error("[ERRO] enviarBotoesIniciais:", err)
+  }
+}
+
+async function enviarBotoesVoltarCancelar(phoneNumberId: string, to: string, bodyText = "."): Promise<void> {
+  const token = Deno.env.get("WHATSAPP_TOKEN")
+  if (!token) return
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: bodyText },
+      action: {
+        buttons: [
+          { type: "reply", reply: { id: "servico_voltar", title: "⬅️ Voltar" } },
+          { type: "reply", reply: { id: "servico_cancelar", title: "❌ Cancelar" } },
+        ]
+      }
+    }
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    const result = await response.json()
+    if (result.error) console.error("[ERRO] enviarBotoesVoltarCancelar:", JSON.stringify(result.error))
+  } catch (err) {
+    console.error("[ERRO] enviarBotoesVoltarCancelar:", err)
   }
 }
 
