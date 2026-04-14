@@ -834,6 +834,88 @@ async function getServicos(barbershopId: string): Promise<Servico[]> {
   return servicos
 }
 
+// ============================================
+// HORÁRIOS DE FUNCIONAMENTO (cache por barbearia)
+// ============================================
+
+interface OpeningHour {
+  day_of_week: number
+  opens_at: string
+  closes_at: string
+  period_order: number
+}
+
+const OPENING_HOURS_CACHE = new Map<string, { data: OpeningHour[]; at: number }>()
+
+async function getOpeningHours(barbershopId: string): Promise<OpeningHour[]> {
+  const cached = OPENING_HOURS_CACHE.get(barbershopId)
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
+  const { data, error } = await supabase
+    .from("opening_hours")
+    .select("day_of_week, opens_at, closes_at, period_order")
+    .eq("barbershop_id", barbershopId)
+    .eq("is_open", true)
+    .order("period_order")
+  if (error) console.error("[ERRO] getOpeningHours:", JSON.stringify(error))
+  const hours = (data || []) as OpeningHour[]
+  OPENING_HOURS_CACHE.set(barbershopId, { data: hours, at: Date.now() })
+  return hours
+}
+
+// Retorna o horário atual em Brasília (UTC-3)
+function agoraBrasilia(): { date: Date; timeStr: string } {
+  const utc = new Date()
+  const date = new Date(utc.getTime() - 3 * 60 * 60 * 1000)
+  const timeStr = `${String(date.getUTCHours()).padStart(2, '0')}:${String(date.getUTCMinutes()).padStart(2, '0')}`
+  return { date, timeStr }
+}
+
+interface DiaDisponivel {
+  label: string  // ex: "Hoje (14/04)", "Amanhã (15/04)", "Seg (21/04)"
+  value: string  // ex: "14/04"
+}
+
+async function getDiasDisponiveis(barbershopId: string): Promise<DiaDisponivel[]> {
+  const openingHours = await getOpeningHours(barbershopId)
+
+  // Agrupa períodos por day_of_week
+  const porDia = new Map<number, OpeningHour[]>()
+  for (const oh of openingHours) {
+    if (!porDia.has(oh.day_of_week)) porDia.set(oh.day_of_week, [])
+    porDia.get(oh.day_of_week)!.push(oh)
+  }
+
+  const { date: hoje, timeStr: horaAtual } = agoraBrasilia()
+  const SEMANA = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb']
+  const dias: DiaDisponivel[] = []
+
+  for (let i = 0; i < 7; i++) {
+    const data = new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth(), hoje.getUTCDate() + i))
+    const jsDay = data.getUTCDay()           // 0=Dom ... 6=Sáb (igual ao banco)
+    const periodos = porDia.get(jsDay) || []
+    if (periodos.length === 0) continue
+
+    // Para hoje: só inclui se algum período ainda não fechou
+    if (i === 0) {
+      const aindaAberto = periodos.some(p => p.closes_at > horaAtual)
+      if (!aindaAberto) continue
+    }
+
+    const dia = String(data.getUTCDate()).padStart(2, '0')
+    const mes = String(data.getUTCMonth() + 1).padStart(2, '0')
+    const value = `${dia}/${mes}`
+
+    let label: string
+    if (i === 0)      label = `Hoje (${value})`
+    else if (i === 1) label = `Amanhã (${value})`
+    else              label = `${SEMANA[jsDay]} (${value})`
+
+    dias.push({ label, value })
+  }
+
+  return dias
+}
+
 const BARBEIROS_MOCK = [
   { id: "1", name: "Carlos", rating: 4.9, especialidade: "Degradê" },
   { id: "2", name: "Rafael", rating: 4.8, especialidade: "Barba" },
@@ -1115,23 +1197,26 @@ async function processarComBotoes(
       if (servicoEncontrado) {
         estado.servico = servicoEncontrado
         estado.etapa = 'dia'
-        await enviarBotoesData(phoneNumberId, from, nomeCliente)
+        await enviarMenuDias(barbershopId, phoneNumberId, from)
         return null
       }
       return `❓ Digite o NÚMERO ou NOME do serviço. (${servicos.length} disponíveis)`
     }
 
-    case 'dia':
-      if (texto === "dia_outra") {
-        return "📅 Digite a data desejada no formato *DD/MM* (ex: 20/04)"
-      }
-      if (texto === "dia_hoje" || texto === "dia_amanha" || texto.match(/^\d{2}\/\d{2}$/)) {
-        estado.dia = texto === "dia_hoje" ? "hoje" : texto === "dia_amanha" ? "amanhã" : texto
+    case 'dia': {
+      const dias = await getDiasDisponiveis(barbershopId)
+      const diaEncontrado = dias.find((d, i) =>
+        String(i + 1) === texto ||
+        d.value === texto
+      )
+      if (diaEncontrado) {
+        estado.dia = diaEncontrado.value
         estado.etapa = 'barbeiro'
         estado.paginaBarbeiros = 1
         return enviarListaBarbeiros(estado.paginaBarbeiros)
       }
-      return "❓ Escolha um dos dias disponíveis ou envie uma data (ex: 15/04)"
+      return `❓ Digite o *NÚMERO* do dia. (${dias.length} disponíveis)`
+    }
 
     case 'barbeiro':
       if (texto.toLowerCase() === "proximo") {
@@ -1229,10 +1314,21 @@ async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, t
   await enviarBotoesVoltar(phoneNumberId, to, "Digite o *NÚMERO* ou *NOME* do serviço acima")
 }
 
-function enviarMenuDias(): string {
-  return `📅 *QUAL DIA?*\n\n` +
-    `Digite: HOJE, AMANHÃ ou DATA (ex: 15/04)\n\n` +
-    `_Digite CANCELAR_`
+async function enviarMenuDias(barbershopId: string, phoneNumberId: string, to: string): Promise<void> {
+  const dias = await getDiasDisponiveis(barbershopId)
+
+  if (dias.length === 0) {
+    await enviarWhatsApp(phoneNumberId, to, "😕 Nenhum dia disponível nos próximos 7 dias. Entre em contato com a barbearia.")
+    return
+  }
+
+  let msg = `📅 *DIAS DISPONÍVEIS*\n\n`
+  dias.forEach((d, i) => {
+    msg += `*${i + 1}. ${d.label}*\n`
+  })
+
+  await enviarWhatsApp(phoneNumberId, to, msg)
+  await enviarBotoesVoltar(phoneNumberId, to, "Digite o *NÚMERO* do dia:")
 }
 
 function enviarListaBarbeiros(pagina: number): string {
