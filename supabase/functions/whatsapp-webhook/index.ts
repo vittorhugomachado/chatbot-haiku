@@ -1072,14 +1072,11 @@ async function processarComBotoes(
     return null
   }
 
-  // BOTÃO CANCELAR AGENDAMENTO
+  // BOTÃO MENU INICIAL → volta para etapa 1 sem cancelar nada
   if (texto === "servico_cancelar") {
     estado.etapa = 'inicio'
-    estado.servico = undefined
-    estado.dia = undefined
-    estado.barbeiro = undefined
-    estado.horario = undefined
-    return "✅ Agendamento cancelado!"
+    await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
+    return null
   }
   console.log("[CHAMOU processarComBotoes]", { texto, etapa: estado.etapa })
   // COMANDOS
@@ -1229,7 +1226,7 @@ async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, t
   })
 
   await enviarWhatsApp(phoneNumberId, to, msg)
-  await enviarBotoesVoltarCancelar(phoneNumberId, to, "Digite o *NÚMERO* ou *NOME* do serviço acima")
+  await enviarBotoesVoltar(phoneNumberId, to, "Digite o *NÚMERO* ou *NOME* do serviço acima")
 }
 
 function enviarMenuDias(): string {
@@ -1247,8 +1244,7 @@ function enviarListaBarbeiros(pagina: number): string {
   let msg = `👨‍🦱 *BARBEIROS (Pág ${pagina}/${totalPaginas})*\n\n`
   
   barbeirosPagina.forEach((b) => {
-    const estrelas = "⭐".repeat(Math.floor(b.rating))
-    msg += `• ${b.id} - ${b.name} ${estrelas}\n  └ ${b.especialidade}\n\n`
+    msg += `• ${b.id} - ${b.name}\n  ${b.especialidade}\n\n`
   })
   
   if (totalPaginas > 1) {
@@ -1315,7 +1311,7 @@ async function enviarBotoesIniciais(phoneNumberId: string, nomeBarbearia: string
   }
 }
 
-async function enviarBotoesVoltarCancelar(phoneNumberId: string, to: string, bodyText = "."): Promise<void> {
+async function enviarBotoesVoltar(phoneNumberId: string, to: string, bodyText = "."): Promise<void> {
   const token = Deno.env.get("WHATSAPP_TOKEN")
   if (!token) return
 
@@ -1329,7 +1325,7 @@ async function enviarBotoesVoltarCancelar(phoneNumberId: string, to: string, bod
       action: {
         buttons: [
           { type: "reply", reply: { id: "servico_voltar", title: "⬅️ Voltar" } },
-          { type: "reply", reply: { id: "servico_cancelar", title: "❌ Cancelar" } },
+          { type: "reply", reply: { id: "servico_cancelar", title: "🏠 Menu inicial" } },
         ]
       }
     }
@@ -1342,9 +1338,9 @@ async function enviarBotoesVoltarCancelar(phoneNumberId: string, to: string, bod
       body: JSON.stringify(payload),
     })
     const result = await response.json()
-    if (result.error) console.error("[ERRO] enviarBotoesVoltarCancelar:", JSON.stringify(result.error))
+    if (result.error) console.error("[ERRO] enviarBotoesVoltar:", JSON.stringify(result.error))
   } catch (err) {
-    console.error("[ERRO] enviarBotoesVoltarCancelar:", err)
+    console.error("[ERRO] enviarBotoesVoltar:", err)
   }
 }
 
