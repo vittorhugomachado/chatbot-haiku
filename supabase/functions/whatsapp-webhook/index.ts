@@ -812,6 +812,7 @@ async function getBarbershopByPhone(phoneNumberId: string): Promise<BarbershopIn
 interface Servico {
   id: string
   name: string
+  description?: string | null
   price: number
   duration_min: number
 }
@@ -823,7 +824,7 @@ async function getServicos(barbershopId: string): Promise<Servico[]> {
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
   const { data, error } = await supabase
     .from("services")
-    .select("id, name, price, duration_min")
+    .select("id, name, price, duration_min, description")
     .eq("barbershop_id", barbershopId)
     .eq("is_active", true)
     .order("name")
@@ -1197,9 +1198,12 @@ async function enviarMenuServicos(barbershopId: string): Promise<string> {
   }
   let msg = `✂️ *SERVIÇOS DISPONÍVEIS (${servicos.length})*\n\n`
   servicos.forEach((s, i) => {
-    msg += `• ${i + 1}. ${s.name} - R$ ${Number(s.price).toFixed(2)}\n`
+    msg += `*${i + 1}. ${s.name}* - R$ ${Number(s.price).toFixed(2).replace('.', ',')}\n`
+    msg += `   ⏱️ ${s.duration_min} minutos\n`
+    if (s.description) msg += `   _${s.description}_\n`
+    msg += `\n`
   })
-  msg += `\nDigite o *NÚMERO* ou *NOME* do serviço.\n\n_Digite CANCELAR_`
+    msg += `\nDigite o *NÚMERO* ou *NOME* do serviço.\n\nPara cancelar é só digitar _CANCELAR_`
   return msg
 }
 
