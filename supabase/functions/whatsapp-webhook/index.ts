@@ -889,9 +889,9 @@ async function getDiasDisponiveis(barbershopId: string): Promise<DiaDisponivel[]
   const SEMANA = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb']
   const dias: DiaDisponivel[] = []
 
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 60 && dias.length < 10; i++) {
     const data = new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth(), hoje.getUTCDate() + i))
-    const jsDay = data.getUTCDay()           // 0=Dom ... 6=Sáb (igual ao banco)
+    const jsDay = data.getUTCDay()
     const periodos = porDia.get(jsDay) || []
     if (periodos.length === 0) continue
 
@@ -1290,7 +1290,7 @@ async function processarComBotoes(
         await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
         return null
       }
-      return `Escolha um serviço da lista.`
+      return await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
     }
 
     case 'servico_confirmar': {
@@ -1319,7 +1319,7 @@ async function processarComBotoes(
         estado.paginaBarbeiros = 1
         return enviarListaBarbeiros(estado.paginaBarbeiros)
       }
-      return `❓ Digite o *NÚMERO* do dia. (${dias.length} disponíveis)`
+      return await enviarMenuDias(barbershopId, phoneNumberId, from)
     }
 
     case 'barbeiro':
