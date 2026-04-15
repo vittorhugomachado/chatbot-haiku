@@ -945,8 +945,9 @@ interface EstadoTeste {
   dia?: string
   barbeiro?: typeof BARBEIROS_MOCK[0]
   horario?: string
+  paginaServicos: number
   paginaBarbeiros: number
-  jaEnviouBoasVindas: boolean  // 🔥 NOVO: controla se já enviou a saudação
+  jaEnviouBoasVindas: boolean
 }
 
 // ============================================
@@ -1076,7 +1077,7 @@ async function buscarEstadoConversa(clienteNumero: string): Promise<EstadoTeste>
     }
   }
 
-  return { etapa: 'inicio', paginaBarbeiros: 1, jaEnviouBoasVindas: false }
+  return { etapa: 'inicio', paginaServicos: 1, paginaBarbeiros: 1, jaEnviouBoasVindas: false }
 }
 
 async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, phoneNumberId: string, barbershopId: string): Promise<void> {
@@ -1129,21 +1130,31 @@ async function processarComBotoes(
   // CLIQUE NO BOTÃO AGENDAR
   if (texto === "acao_agendar") {
     estado.etapa = 'servico'
-    await enviarMenuServicos(barbershopId, phoneNumberId, from)
+    estado.paginaServicos = 1
+    await enviarMenuServicos(barbershopId, phoneNumberId, from, 1)
     return null
   }
 
   // CLIQUE NO BOTÃO MEUS AGENDAMENTOS
   if (texto === "acao_meus_agendamentos") {
     estado.etapa = 'listar_agendamentos'
-    await enviarMenuServicos(barbershopId, phoneNumberId, from)
+    await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
     return null
   }
 
   //CLIQUE NO BOTÃO INFORMAÇÕES
   if (texto === "acao_informacoes") {
     estado.etapa = 'informacoes'
-    await enviarMenuServicos(barbershopId, phoneNumberId, from)
+    await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
+    return null
+  }
+
+  // NAVEGAÇÃO PAGINAÇÃO DE SERVIÇOS (página embutida no ID → funciona em mensagens antigas)
+  const navMatch = texto.match(/^servico_pagina_(\d+)$/)
+  if (navMatch) {
+    const pagina = parseInt(navMatch[1])
+    estado.paginaServicos = pagina
+    await enviarMenuServicos(barbershopId, phoneNumberId, from, pagina)
     return null
   }
 
@@ -1176,12 +1187,46 @@ async function processarComBotoes(
     return "Digite *AGENDAR* para começar!"
   }
 
+  // ============================================
+  // DETECÇÃO DE CLIQUE EM MENSAGEM ANTIGA
+  // Se o input pertence a uma etapa anterior, reseta o fluxo para ela
+  // ============================================
+
+  // Clicou em serviço antigo (UUID) estando em etapa posterior
+  if (estado.etapa !== 'servico' && estado.etapa !== 'inicio') {
+    const servicos = await getServicos(barbershopId)
+    const servicoAntigo = servicos.find(s => s.id === texto)
+    if (servicoAntigo) {
+      estado.servico = servicoAntigo
+      estado.dia = undefined
+      estado.barbeiro = undefined
+      estado.horario = undefined
+      estado.etapa = 'dia'
+      await enviarMenuDias(barbershopId, phoneNumberId, from)
+      return null
+    }
+  }
+
+  // Clicou em dia antigo (DD/MM) estando em etapa posterior (barbeiro, horario, confirmacao)
+  if (['barbeiro', 'horario', 'confirmacao'].includes(estado.etapa) && texto.match(/^\d{2}\/\d{2}$/)) {
+    const dias = await getDiasDisponiveis(barbershopId)
+    const diaAntigo = dias.find(d => d.value === texto)
+    if (diaAntigo) {
+      estado.dia = diaAntigo.value
+      estado.barbeiro = undefined
+      estado.horario = undefined
+      estado.etapa = 'barbeiro'
+      estado.paginaBarbeiros = 1
+      return enviarListaBarbeiros(1)
+    }
+  }
+
   // FLUXO
   switch (estado.etapa) {
     case 'inicio':
       if (texto.toLowerCase() === "agendar") {
         estado.etapa = 'servico'
-        await enviarMenuServicos(barbershopId, phoneNumberId, from)
+        await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
         return null
       }
       await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente, "Pra gente seguir com teu agendamento é só clicar em uma das opções abaixo 😊")
@@ -1281,7 +1326,7 @@ async function processarComBotoes(
       if (texto.toLowerCase() === "nao" || texto.toLowerCase() === "cancelar") {
         estado.etapa = 'servico'
         estado.servico = undefined
-        await enviarMenuServicos(barbershopId, phoneNumberId, from)
+        await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
         return null
       }
       
@@ -1295,23 +1340,92 @@ async function processarComBotoes(
 // MENSAGENS
 // ============================================
 
-async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, to: string): Promise<void> {
+async function enviarListaInterativa(
+  phoneNumberId: string,
+  to: string,
+  header: string,
+  body: string,
+  buttonText: string,
+  sectionTitle: string,
+  rows: { id: string; title: string; description?: string }[]
+): Promise<void> {
+  const token = Deno.env.get("WHATSAPP_TOKEN")
+  if (!token) return
+
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: { type: "text", text: header },
+      body: { text: body },
+      action: {
+        button: buttonText,
+        sections: [{ title: sectionTitle, rows }]
+      }
+    }
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    const result = await response.json()
+    if (result.error) console.error("[ERRO] enviarListaInterativa:", JSON.stringify(result.error))
+    else console.log("[LISTA] Enviada com sucesso")
+  } catch (err) {
+    console.error("[ERRO] enviarListaInterativa:", err)
+  }
+}
+
+async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, to: string, pagina = 1): Promise<void> {
   const servicos = await getServicos(barbershopId)
   if (servicos.length === 0) {
     await enviarWhatsApp(phoneNumberId, to, "⚠️ Nenhum serviço disponível no momento. Tente novamente em breve.")
     return
   }
 
-  let msg = `✂️ *SERVIÇOS DISPONÍVEIS (${servicos.length})*\n\n`
-  servicos.forEach((s, i) => {
-    msg += `*${i + 1}. ${s.name}* - R$ ${Number(s.price).toFixed(2).replace('.', ',')}\n`
-    msg += `   ⏱️ ${s.duration_min} minutos\n`
-    if (s.description) msg += `   _${s.description}_\n`
-    msg += `\n`
-  })
+  const temPaginacao = servicos.length > 10
+  // Quando há paginação, reserva as últimas linhas para navegação
+  const ITEMS_POR_PAGINA = temPaginacao ? 8 : 10
+  const totalPaginas = Math.ceil(servicos.length / ITEMS_POR_PAGINA)
+  const paginaValida = Math.min(Math.max(pagina, 1), totalPaginas)
+  const inicio = (paginaValida - 1) * ITEMS_POR_PAGINA
+  const servicosPagina = servicos.slice(inicio, inicio + ITEMS_POR_PAGINA)
 
-  await enviarWhatsApp(phoneNumberId, to, msg)
-  await enviarBotoesVoltar(phoneNumberId, to, "Digite o *NÚMERO* ou *NOME* do serviço acima")
+  const temAnterior = paginaValida > 1
+  const temProxima  = paginaValida < totalPaginas
+
+  const rows: { id: string; title: string; description?: string }[] = servicosPagina.map(s => ({
+    id: s.id,
+    title: s.name.slice(0, 24),
+    description: `R$ ${Number(s.price).toFixed(2).replace('.', ',')} • ${s.duration_min} min${s.description ?}`
+  }))
+
+  // Navegação como últimas linhas — ID contém a página destino (evita erro ao clicar em mensagens antigas)
+  if (temAnterior) rows.push({ id: `servico_pagina_${paginaValida - 1}`, title: "⬅️ Página anterior", description: `Ir para página ${paginaValida - 1}` })
+  if (temProxima)  rows.push({ id: `servico_pagina_${paginaValida + 1}`, title: "Próxima página ➡️",  description: `Ir para página ${paginaValida + 1}` })
+
+  const buttonText = temPaginacao
+    ? `Ver serviços (${paginaValida}/${totalPaginas})`.slice(0, 20)
+    : "Ver serviços"
+
+  const bodyText = temPaginacao
+    ? `Clique no botão para ver a lista ${paginaValida}/${totalPaginas} de serviços:`
+    : "Clique no botão para ver os serviços:"
+
+  await enviarListaInterativa(
+    phoneNumberId, to,
+    "✂️ Serviços",
+    bodyText,
+    buttonText,
+    "Disponíveis",
+    rows
+  )
 }
 
 async function enviarMenuDias(barbershopId: string, phoneNumberId: string, to: string): Promise<void> {
@@ -1322,13 +1436,19 @@ async function enviarMenuDias(barbershopId: string, phoneNumberId: string, to: s
     return
   }
 
-  let msg = `📅 *DIAS DISPONÍVEIS*\n\n`
-  dias.forEach((d, i) => {
-    msg += `*${i + 1}. ${d.label}*\n`
-  })
+  const rows = dias.map(d => ({
+    id: d.value,
+    title: d.label.slice(0, 24),
+  }))
 
-  await enviarWhatsApp(phoneNumberId, to, msg)
-  await enviarBotoesVoltar(phoneNumberId, to, "Digite o *NÚMERO* do dia:")
+  await enviarListaInterativa(
+    phoneNumberId, to,
+    "📅 Escolha o dia",
+    "Toque no botão e escolha uma data:",
+    "Ver datas",
+    "Próximos 7 dias",
+    rows
+  )
 }
 
 function enviarListaBarbeiros(pagina: number): string {
