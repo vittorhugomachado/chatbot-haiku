@@ -1131,6 +1131,7 @@ async function processarComBotoes(
   if (texto === "acao_agendar") {
     estado.etapa = 'servico'
     estado.paginaServicos = 1
+    await enviarWhatsApp(phoneNumberId, from, "📅 *Vamos iniciar seu agendamento!*\n\nDurante o processo você pode usar:\n• *VOLTAR* — retorna à etapa anterior\n• *CANCELAR* — cancela o agendamento\n• *MENU INICIAL* — volta ao menu principal")
     await enviarMenuServicos(barbershopId, phoneNumberId, from, 1)
     return null
   }
@@ -1173,7 +1174,7 @@ async function processarComBotoes(
   }
   console.log("[CHAMOU processarComBotoes]", { texto, etapa: estado.etapa })
   // COMANDOS
-  if (texto === "cancelar" || texto === "sair") {
+  if (["cancelar", "sair"].includes(texto.toLowerCase())) {
     estado.etapa = 'inicio'
     estado.servico = undefined
     estado.dia = undefined
@@ -1182,9 +1183,46 @@ async function processarComBotoes(
     return "✅ Agendamento cancelado. Digite *AGENDAR* para começar!"
   }
 
-  if (texto === "menu" || texto === "inicio") {
+  if (["menu", "inicio", "menu inicial"].includes(texto.toLowerCase())) {
     estado.etapa = 'inicio'
-    return "Digite *AGENDAR* para começar!"
+    estado.servico = undefined
+    estado.dia = undefined
+    estado.barbeiro = undefined
+    estado.horario = undefined
+    await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
+    return null
+  }
+
+  if (texto.toLowerCase() === "voltar") {
+    switch (estado.etapa) {
+      case 'servico':
+        estado.etapa = 'inicio'
+        estado.servico = undefined
+        await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
+        return null
+      case 'dia':
+        estado.etapa = 'servico'
+        estado.dia = undefined
+        await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
+        return null
+      case 'barbeiro':
+        estado.etapa = 'dia'
+        estado.barbeiro = undefined
+        await enviarMenuDias(barbershopId, phoneNumberId, from)
+        return null
+      case 'horario':
+        estado.etapa = 'barbeiro'
+        estado.horario = undefined
+        estado.paginaBarbeiros = 1
+        return enviarListaBarbeiros(1)
+      case 'confirmacao':
+        estado.etapa = 'horario'
+        estado.horario = undefined
+        return enviarMenuHorarios()
+      default:
+        await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
+        return null
+    }
   }
 
   // ============================================
@@ -1244,7 +1282,7 @@ async function processarComBotoes(
         await enviarMenuDias(barbershopId, phoneNumberId, from)
         return null
       }
-      return `❓ Digite o NÚMERO ou NOME do serviço. (${servicos.length} disponíveis)`
+      return `Escolha um serviço da lista.`
     }
 
     case 'dia': {
@@ -1389,7 +1427,7 @@ async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, t
   }
 
   const temPaginacao = servicos.length > 10
-  // Quando há paginação, reserva as últimas linhas para navegação
+  // Com paginação reserva 2 linhas para anterior/próxima, sem paginação usa tudo
   const ITEMS_POR_PAGINA = temPaginacao ? 8 : 10
   const totalPaginas = Math.ceil(servicos.length / ITEMS_POR_PAGINA)
   const paginaValida = Math.min(Math.max(pagina, 1), totalPaginas)
