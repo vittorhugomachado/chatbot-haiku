@@ -822,14 +822,30 @@ const SERVICOS_CACHE = new Map<string, { data: Servico[]; at: number }>()
 async function getServicos(barbershopId: string): Promise<Servico[]> {
   const cached = SERVICOS_CACHE.get(barbershopId)
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
+  
+  // Busca serviços que têm pelo menos um barbeiro associado
   const { data, error } = await supabase
     .from("services")
-    .select("id, name, price, duration_min, description")
+    .select(`
+      id, 
+      name, 
+      price, 
+      duration_min, 
+      description,
+      barber_services!inner (barber_id)
+    `)
     .eq("barbershop_id", barbershopId)
     .eq("is_active", true)
     .order("name")
-  if (error) console.error("[ERRO] getServicos:", JSON.stringify(error))
-  const servicos = (data || []) as Servico[]
+
+  if (error) {
+    console.error("[ERRO] getServicos:", JSON.stringify(error))
+    return []
+  }
+  
+  // Remove o campo barber_services da resposta (não precisamos dele)
+  const servicos = (data || []).map(({ barber_services, ...rest }: any) => rest) as Servico[]
+  
   SERVICOS_CACHE.set(barbershopId, { data: servicos, at: Date.now() })
   return servicos
 }
@@ -1335,20 +1351,28 @@ async function processarComBotoes(
         s.name.toLowerCase() === texto.toLowerCase()
       )
       if (servicoEncontrado) {
-        if (!estado.servicos.find(s => s.id === servicoEncontrado.id)) {
-          estado.servicos.push(servicoEncontrado)
+        // 🔥 VERIFICA SE JÁ FOI SELECIONADO
+        const jaSelecionado = estado.servicos.some(s => s.id === servicoEncontrado.id)
+        if (jaSelecionado) {
+          // Mostra mensagem de aviso e reenvia a lista
+          await enviarWhatsApp(phoneNumberId, from, `⚠️ *${servicoEncontrado.name}* já foi selecionado!\n\nEscolha outro serviço.`)
+          await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
+          return null
         }
+        
+        estado.servicos.push(servicoEncontrado)
         estado.etapa = 'servico_confirmar'
         await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
         return null
       }
-      return await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
+      return await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1, estado.servicos)
     }
 
     case 'servico_confirmar': {
       if (texto === "servico_adicionar") {
         estado.etapa = 'servico'
-        await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
+        // 🔥 PASSA OS SERVIÇOS JÁ SELECIONADOS!
+        await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1, estado.servicos)
         return null
       }
       if (texto === "servico_continuar") {
@@ -1490,33 +1514,35 @@ async function enviarListaInterativa(
   }
 }
 
-async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, to: string, pagina = 1): Promise<void> {
+async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, to: string, pagina = 1, servicosSelecionados: Servico[] = []): Promise<void> {
   const servicos = await getServicos(barbershopId)
   if (servicos.length === 0) {
-    await enviarWhatsApp(phoneNumberId, to, "⚠️ Nenhum serviço disponível no momento. Tente novamente em breve.")
+    await enviarWhatsApp(phoneNumberId, to, "⚠️ Nenhum serviço disponível no momento.")
     return
   }
 
+  const idsSelecionados = new Set(servicosSelecionados.map(s => s.id))
   const temPaginacao = servicos.length > 10
-  // Com paginação reserva 2 linhas para anterior/próxima, sem paginação usa tudo
   const ITEMS_POR_PAGINA = temPaginacao ? 8 : 10
   const totalPaginas = Math.ceil(servicos.length / ITEMS_POR_PAGINA)
   const paginaValida = Math.min(Math.max(pagina, 1), totalPaginas)
   const inicio = (paginaValida - 1) * ITEMS_POR_PAGINA
   const servicosPagina = servicos.slice(inicio, inicio + ITEMS_POR_PAGINA)
 
+  // 🔥 DEFINE AS VARIÁVEIS AQUI!
   const temAnterior = paginaValida > 1
-  const temProxima  = paginaValida < totalPaginas
+  const temProxima = paginaValida < totalPaginas
 
-  const rows: { id: string; title: string; description?: string }[] = servicosPagina.map(s => ({
-    id: s.id,
-    title: s.name.slice(0, 24),
-    description: `R$ ${Number(s.price).toFixed(2).replace('.', ',')} • ${s.duration_min} min`
-  }))
+  const rows: { id: string; title: string; description?: string }[] = servicosPagina.map(s => {
+    const selecionado = idsSelecionados.has(s.id)
+    const title = selecionado ? `${s.name.slice(0, 22)}` : s.name.slice(0, 24)
+    const description = `R$ ${Number(s.price).toFixed(2).replace('.', ',')} • ${s.duration_min} min${selecionado ? ' • ✅ já selecionado' : ''}`
+    return { id: s.id, title, description }
+  })
 
-  // Navegação como últimas linhas — ID contém a página destino (evita erro ao clicar em mensagens antigas)
+  // Navegação como últimas linhas
   if (temAnterior) rows.push({ id: `servico_pagina_${paginaValida - 1}`, title: "⬅️ Página anterior", description: `Ir para página ${paginaValida - 1}` })
-  if (temProxima)  rows.push({ id: `servico_pagina_${paginaValida + 1}`, title: "Próxima página ➡️",  description: `Ir para página ${paginaValida + 1}` })
+  if (temProxima) rows.push({ id: `servico_pagina_${paginaValida + 1}`, title: "Próxima página ➡️", description: `Ir para página ${paginaValida + 1}` })
 
   const buttonText = temPaginacao
     ? `Ver serviços (${paginaValida}/${totalPaginas})`.slice(0, 20)
