@@ -1403,7 +1403,7 @@ async function enviarMenuServicos(barbershopId: string, phoneNumberId: string, t
   const rows: { id: string; title: string; description?: string }[] = servicosPagina.map(s => ({
     id: s.id,
     title: s.name.slice(0, 24),
-    description: `R$ ${Number(s.price).toFixed(2).replace('.', ',')} • ${s.duration_min} min${s.description ?}`
+    description: `R$ ${Number(s.price).toFixed(2).replace('.', ',')} • ${s.duration_min} min`
   }))
 
   // Navegação como últimas linhas — ID contém a página destino (evita erro ao clicar em mensagens antigas)
