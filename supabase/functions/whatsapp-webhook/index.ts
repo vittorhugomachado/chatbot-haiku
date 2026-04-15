@@ -940,8 +940,8 @@ const BARBEIROS_MOCK = [
 ]
 
 interface EstadoTeste {
-  etapa: 'inicio' | 'servico' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao' | 'informacoes' | 'listar_agendamentos'
-  servico?: Servico
+  etapa: 'inicio' | 'servico' | 'servico_confirmar' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao' | 'informacoes' | 'listar_agendamentos'
+  servicos: Servico[]
   dia?: string
   barbeiro?: typeof BARBEIROS_MOCK[0]
   horario?: string
@@ -1077,7 +1077,7 @@ async function buscarEstadoConversa(clienteNumero: string): Promise<EstadoTeste>
     }
   }
 
-  return { etapa: 'inicio', paginaServicos: 1, paginaBarbeiros: 1, jaEnviouBoasVindas: false }
+  return { etapa: 'inicio', servicos: [], paginaServicos: 1, paginaBarbeiros: 1, jaEnviouBoasVindas: false }
 }
 
 async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, phoneNumberId: string, barbershopId: string): Promise<void> {
@@ -1176,7 +1176,7 @@ async function processarComBotoes(
   // COMANDOS
   if (["cancelar", "sair"].includes(texto.toLowerCase())) {
     estado.etapa = 'inicio'
-    estado.servico = undefined
+    estado.servicos = []
     estado.dia = undefined
     estado.barbeiro = undefined
     estado.horario = undefined
@@ -1185,7 +1185,7 @@ async function processarComBotoes(
 
   if (["menu", "inicio", "menu inicial"].includes(texto.toLowerCase())) {
     estado.etapa = 'inicio'
-    estado.servico = undefined
+    estado.servicos = []
     estado.dia = undefined
     estado.barbeiro = undefined
     estado.horario = undefined
@@ -1197,13 +1197,19 @@ async function processarComBotoes(
     switch (estado.etapa) {
       case 'servico':
         estado.etapa = 'inicio'
-        estado.servico = undefined
+        estado.servicos = []
         await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
         return null
-      case 'dia':
+      case 'servico_confirmar':
+        // Remove o último serviço adicionado e volta para a lista
+        estado.servicos.pop()
         estado.etapa = 'servico'
-        estado.dia = undefined
         await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
+        return null
+      case 'dia':
+        estado.etapa = 'servico_confirmar'
+        estado.dia = undefined
+        await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
         return null
       case 'barbeiro':
         estado.etapa = 'dia'
@@ -1231,16 +1237,16 @@ async function processarComBotoes(
   // ============================================
 
   // Clicou em serviço antigo (UUID) estando em etapa posterior
-  if (estado.etapa !== 'servico' && estado.etapa !== 'inicio') {
+  if (!['servico', 'servico_confirmar', 'inicio'].includes(estado.etapa)) {
     const servicos = await getServicos(barbershopId)
     const servicoAntigo = servicos.find(s => s.id === texto)
     if (servicoAntigo) {
-      estado.servico = servicoAntigo
+      estado.servicos = [servicoAntigo]
       estado.dia = undefined
       estado.barbeiro = undefined
       estado.horario = undefined
-      estado.etapa = 'dia'
-      await enviarMenuDias(barbershopId, phoneNumberId, from)
+      estado.etapa = 'servico_confirmar'
+      await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
       return null
     }
   }
@@ -1277,12 +1283,28 @@ async function processarComBotoes(
         s.name.toLowerCase() === texto.toLowerCase()
       )
       if (servicoEncontrado) {
-        estado.servico = servicoEncontrado
+        if (!estado.servicos.find(s => s.id === servicoEncontrado.id)) {
+          estado.servicos.push(servicoEncontrado)
+        }
+        estado.etapa = 'servico_confirmar'
+        await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
+        return null
+      }
+      return `Escolha um serviço da lista.`
+    }
+
+    case 'servico_confirmar': {
+      if (texto === "servico_adicionar") {
+        estado.etapa = 'servico'
+        await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
+        return null
+      }
+      if (texto === "servico_continuar") {
         estado.etapa = 'dia'
         await enviarMenuDias(barbershopId, phoneNumberId, from)
         return null
       }
-      return `Escolha um serviço da lista.`
+      return null
     }
 
     case 'dia': {
@@ -1343,26 +1365,28 @@ async function processarComBotoes(
 
     case 'confirmacao':
       if (texto.toLowerCase() === "sim" || texto.toLowerCase() === "confirmar" || texto.toLowerCase() === "ok") {
+        const listaServicos = estado.servicos.map(s => `  • ${s.name} — R$ ${Number(s.price).toFixed(2).replace('.', ',')}`).join('\n')
+        const totalValor = estado.servicos.reduce((acc, s) => acc + Number(s.price), 0)
         const msg = `✅ *AGENDADO!*\n\n` +
-          `• Serviço: ${estado.servico?.name}\n` +
-          `• Valor: R$ ${estado.servico?.price}\n` +
-          `• Barbeiro: ${estado.barbeiro?.name} ⭐ ${estado.barbeiro?.rating}\n` +
+          `*Serviços:*\n${listaServicos}\n` +
+          `*Total: R$ ${totalValor.toFixed(2).replace('.', ',')}*\n\n` +
+          `• Barbeiro: ${estado.barbeiro?.name}\n` +
           `• Data: ${estado.dia}\n` +
           `• Horário: ${estado.horario}\n\n` +
           `Te esperamos! 💈`
-        
+
         estado.etapa = 'inicio'
-        estado.servico = undefined
+        estado.servicos = []
         estado.dia = undefined
         estado.barbeiro = undefined
         estado.horario = undefined
-        
+
         return msg
       }
       
       if (texto.toLowerCase() === "nao" || texto.toLowerCase() === "cancelar") {
         estado.etapa = 'servico'
-        estado.servico = undefined
+        estado.servicos = []
         await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
         return null
       }
@@ -1515,10 +1539,13 @@ function enviarMenuHorarios(): string {
 }
 
 function mensagemConfirmacao(estado: EstadoTeste, nomeCliente: string): string {
+  const listaServicos = estado.servicos.map(s => `  • ${s.name} — R$ ${Number(s.price).toFixed(2).replace('.', ',')}`).join('\n')
+  const totalValor = estado.servicos.reduce((acc, s) => acc + Number(s.price), 0)
   return `📋 *CONFIRMAR*\n\n` +
     `👤 ${nomeCliente}\n` +
-    `✂️ ${estado.servico?.name} - R$ ${estado.servico?.price}\n` +
-    `👨‍🦱 ${estado.barbeiro?.name} ⭐ ${estado.barbeiro?.rating}\n` +
+    `✂️ *Serviços:*\n${listaServicos}\n` +
+    `💰 *Total: R$ ${totalValor.toFixed(2).replace('.', ',')}*\n\n` +
+    `👨‍🦱 ${estado.barbeiro?.name}\n` +
     `📅 ${estado.dia} às ${estado.horario}\n\n` +
     `Digite *SIM* ou *NAO*`
 }
@@ -1561,6 +1588,43 @@ async function enviarBotoesIniciais(phoneNumberId: string, nomeBarbearia: string
     else console.log("[BOTÕES] Enviados com sucesso")
   } catch (err) {
     console.error("[ERRO] enviarBotoesIniciais:", err)
+  }
+}
+
+async function enviarBotoesAdicionarServico(phoneNumberId: string, to: string, servicos: Servico[]): Promise<void> {
+  const token = Deno.env.get("WHATSAPP_TOKEN")
+  if (!token) return
+
+  const lista = servicos.map(s => `• ${s.name} — R$ ${Number(s.price).toFixed(2).replace('.', ',')}`).join('\n')
+  const total = servicos.reduce((acc, s) => acc + Number(s.price), 0)
+  const body = `✅ *${servicos.length === 1 ? 'Serviço adicionado' : 'Serviços selecionados'}:*\n${lista}\n\n💰 *Total: R$ ${total.toFixed(2).replace('.', ',')}*\n\nDeseja adicionar outro serviço?`
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: body },
+      action: {
+        buttons: [
+          { type: "reply", reply: { id: "servico_adicionar", title: "➕ Adicionar serviço" } },
+          { type: "reply", reply: { id: "servico_continuar", title: "✅ Continuar" } },
+        ]
+      }
+    }
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    const result = await response.json()
+    if (result.error) console.error("[ERRO] enviarBotoesAdicionarServico:", JSON.stringify(result.error))
+  } catch (err) {
+    console.error("[ERRO] enviarBotoesAdicionarServico:", err)
   }
 }
 
