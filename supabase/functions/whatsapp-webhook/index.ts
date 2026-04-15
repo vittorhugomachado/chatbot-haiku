@@ -916,34 +916,84 @@ async function getDiasDisponiveis(barbershopId: string): Promise<DiaDisponivel[]
   return dias
 }
 
-const BARBEIROS_MOCK = [
-  { id: "1", name: "Carlos", rating: 4.9, especialidade: "Degradê" },
-  { id: "2", name: "Rafael", rating: 4.8, especialidade: "Barba" },
-  { id: "3", name: "Eduardo", rating: 4.9, especialidade: "Platinados" },
-  { id: "4", name: "Lucas", rating: 4.7, especialidade: "Cortes Sociais" },
-  { id: "5", name: "Gustavo", rating: 4.8, especialidade: "Navalha" },
-  { id: "6", name: "André", rating: 4.6, especialidade: "Cortes Infantis" },
-  { id: "7", name: "Mateus", rating: 4.5, especialidade: "Aprendiz" },
-  { id: "8", name: "Bruno", rating: 4.7, especialidade: "Finalização" },
-  { id: "9", name: "Felipe", rating: 4.8, especialidade: "Terapia" },
-  { id: "10", name: "Rodrigo", rating: 4.9, especialidade: "Militares" },
-  { id: "11", name: "Samuel", rating: 4.7, especialidade: "UnderCut" },
-  { id: "12", name: "Thiago", rating: 4.8, especialidade: "Barba Desenhada" },
-  { id: "13", name: "Diego", rating: 4.6, especialidade: "Cabelo Cacheado" },
-  { id: "14", name: "Henrique", rating: 4.9, especialidade: "Platinado" },
-  { id: "15", name: "Leonardo", rating: 4.7, especialidade: "Tesoura" },
-  { id: "16", name: "Vinicius", rating: 4.8, especialidade: "Máquina" },
-  { id: "17", name: "Paulo", rating: 4.6, especialidade: "Mechas" },
-  { id: "18", name: "Marcelo", rating: 4.7, especialidade: "Coloração" },
-  { id: "19", name: "Renato", rating: 4.8, especialidade: "Luzes" },
-  { id: "20", name: "Fábio", rating: 4.9, especialidade: "Premium" }
-]
+interface Barbeiro {
+  id: string
+  name: string
+  description?: string | null
+}
+
+const BARBEIROS_CACHE = new Map<string, { data: Barbeiro[]; at: number }>()
+
+async function getBarbeiros(barbershopId: string, serviceIds: string[], diaDDMM: string): Promise<Barbeiro[]> {
+  const cacheKey = `${barbershopId}:${[...serviceIds].sort().join(',')}:${diaDDMM}`
+  const cached = BARBEIROS_CACHE.get(cacheKey)
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
+
+  // Converte DD/MM para day_of_week
+  const [dd, mm] = diaDDMM.split('/').map(Number)
+  const now = new Date()
+  let year = now.getUTCFullYear()
+  let dataAlvo = new Date(Date.UTC(year, mm - 1, dd))
+  const hoje = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+  if (dataAlvo < hoje) dataAlvo = new Date(Date.UTC(year + 1, mm - 1, dd))
+  const dayOfWeek = dataAlvo.getUTCDay()
+
+  // Busca barbeiros ativos com disponibilidade no dia
+  const { data: disponiveis, error: errDisp } = await supabase
+    .from('barbers')
+    .select('id, name, description, barber_availability!inner(day_of_week, is_day_off)')
+    .eq('barbershop_id', barbershopId)
+    .eq('is_active', true)
+    .eq('barber_availability.day_of_week', dayOfWeek)
+    .eq('barber_availability.is_day_off', false)
+
+  if (errDisp) {
+    console.error('[ERRO] getBarbeiros (disponibilidade):', JSON.stringify(errDisp))
+    return []
+  }
+
+  const disponiveisIds = (disponiveis || []).map((b: any) => b.id)
+  if (disponiveisIds.length === 0) {
+    BARBEIROS_CACHE.set(cacheKey, { data: [], at: Date.now() })
+    return []
+  }
+
+  // Busca quais serviços cada barbeiro realiza
+  const { data: bs, error: errBs } = await supabase
+    .from('barber_services')
+    .select('barber_id, service_id')
+    .in('barber_id', disponiveisIds)
+    .in('service_id', serviceIds)
+
+  if (errBs) {
+    console.error('[ERRO] getBarbeiros (barber_services):', JSON.stringify(errBs))
+    return []
+  }
+
+  // Monta mapa barber_id → conjunto de service_ids que ele realiza
+  const servicosPorBarbeiro = new Map<string, Set<string>>()
+  for (const row of (bs || [])) {
+    if (!servicosPorBarbeiro.has(row.barber_id)) servicosPorBarbeiro.set(row.barber_id, new Set())
+    servicosPorBarbeiro.get(row.barber_id)!.add(row.service_id)
+  }
+
+  // Filtra: barbeiro precisa realizar TODOS os serviços selecionados
+  const result: Barbeiro[] = (disponiveis || [])
+    .filter((b: any) => {
+      const realizados = servicosPorBarbeiro.get(b.id)
+      return serviceIds.every(sid => realizados?.has(sid))
+    })
+    .map((b: any) => ({ id: b.id, name: b.name, description: b.description ?? null }))
+
+  BARBEIROS_CACHE.set(cacheKey, { data: result, at: Date.now() })
+  return result
+}
 
 interface EstadoTeste {
   etapa: 'inicio' | 'servico' | 'servico_confirmar' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao' | 'informacoes' | 'listar_agendamentos'
   servicos: Servico[]
   dia?: string
-  barbeiro?: typeof BARBEIROS_MOCK[0]
+  barbeiro?: Barbeiro
   horario?: string
   paginaServicos: number
   paginaBarbeiros: number
@@ -1220,7 +1270,8 @@ async function processarComBotoes(
         estado.etapa = 'barbeiro'
         estado.horario = undefined
         estado.paginaBarbeiros = 1
-        return enviarListaBarbeiros(1)
+        await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!, phoneNumberId, from, 1)
+        return null
       case 'confirmacao':
         estado.etapa = 'horario'
         estado.horario = undefined
@@ -1261,7 +1312,8 @@ async function processarComBotoes(
       estado.horario = undefined
       estado.etapa = 'barbeiro'
       estado.paginaBarbeiros = 1
-      return enviarListaBarbeiros(1)
+      await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia, phoneNumberId, from, 1)
+      return null
     }
   }
 
@@ -1317,40 +1369,35 @@ async function processarComBotoes(
         estado.dia = diaEncontrado.value
         estado.etapa = 'barbeiro'
         estado.paginaBarbeiros = 1
-        return enviarListaBarbeiros(estado.paginaBarbeiros)
+        await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia, phoneNumberId, from, 1)
+        return null
       }
       return await enviarMenuDias(barbershopId, phoneNumberId, from)
     }
 
-    case 'barbeiro':
-      if (texto.toLowerCase() === "proximo") {
-        const totalPaginas = Math.ceil(BARBEIROS_MOCK.length / 10)
-        if (estado.paginaBarbeiros < totalPaginas) {
-          estado.paginaBarbeiros++
-          return enviarListaBarbeiros(estado.paginaBarbeiros)
-        }
-        return "📋 Última página. Digite o NÚMERO do barbeiro."
+    case 'barbeiro': {
+      // Navegação de página (IDs como "barbeiro_pagina_2")
+      const matchPagBarbeiro = texto.match(/^barbeiro_pagina_(\d+)$/)
+      if (matchPagBarbeiro) {
+        const novaPag = parseInt(matchPagBarbeiro[1], 10)
+        estado.paginaBarbeiros = novaPag
+        await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!, phoneNumberId, from, novaPag)
+        return null
       }
-      
-      if (texto.toLowerCase() === "anterior") {
-        if (estado.paginaBarbeiros > 1) {
-          estado.paginaBarbeiros--
-          return enviarListaBarbeiros(estado.paginaBarbeiros)
-        }
-        return "📋 Primeira página."
-      }
-      
-      const barbeiro = BARBEIROS_MOCK.find(b => 
-        b.id === texto || 
-        b.name.toLowerCase().includes(texto.toLowerCase())
-      )
-      
+
+      // Seleção de barbeiro pelo UUID (clique na lista interativa)
+      const barbeiros = await getBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!)
+      const barbeiro = barbeiros.find(b => b.id === texto)
       if (barbeiro) {
         estado.barbeiro = barbeiro
         estado.etapa = 'horario'
         return enviarMenuHorarios()
       }
-      return "❓ Digite o NÚMERO ou NOME do barbeiro, ou PROXIMO para ver mais."
+
+      // Texto não reconhecido: reenvia a lista
+      await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!, phoneNumberId, from, estado.paginaBarbeiros)
+      return null
+    }
 
     case 'horario':
       const horarioMatch = texto.match(/(\d{1,2})[:h]?(\d{2})?/)
@@ -1512,23 +1559,55 @@ async function enviarMenuDias(barbershopId: string, phoneNumberId: string, to: s
   )
 }
 
-function enviarListaBarbeiros(pagina: number): string {
-  const itensPorPagina = 10
-  const inicio = (pagina - 1) * itensPorPagina
-  const barbeirosPagina = BARBEIROS_MOCK.slice(inicio, inicio + itensPorPagina)
-  const totalPaginas = Math.ceil(BARBEIROS_MOCK.length / itensPorPagina)
-  
-  let msg = `👨‍🦱 *BARBEIROS (Pág ${pagina}/${totalPaginas})*\n\n`
-  
-  barbeirosPagina.forEach((b) => {
-    msg += `• ${b.id} - ${b.name}\n  ${b.especialidade}\n\n`
-  })
-  
-  if (totalPaginas > 1) {
-    msg += `Digite PROXIMO ou ANTERIOR\n`
+async function enviarMenuBarbeiros(
+  barbershopId: string,
+  serviceIds: string[],
+  diaDDMM: string,
+  phoneNumberId: string,
+  to: string,
+  pagina = 1
+): Promise<void> {
+  const barbeiros = await getBarbeiros(barbershopId, serviceIds, diaDDMM)
+
+  if (barbeiros.length === 0) {
+    await enviarWhatsApp(phoneNumberId, to, "😕 Nenhum barbeiro disponível para os serviços e dia selecionados. Tente outro dia.")
+    return
   }
-  msg += `\nDigite o NÚMERO ou NOME do barbeiro.\n\n_Digite CANCELAR_`
-  return msg
+
+  const temPaginacao = barbeiros.length > 10
+  const ITEMS_POR_PAGINA = temPaginacao ? 8 : 10
+  const totalPaginas = Math.ceil(barbeiros.length / ITEMS_POR_PAGINA)
+  const paginaValida = Math.min(Math.max(pagina, 1), totalPaginas)
+  const inicio = (paginaValida - 1) * ITEMS_POR_PAGINA
+  const barbeirosPagina = barbeiros.slice(inicio, inicio + ITEMS_POR_PAGINA)
+
+  const rows: { id: string; title: string; description?: string }[] = barbeirosPagina.map(b => ({
+    id: b.id,
+    title: b.name.slice(0, 24),
+    description: b.description ? b.description.slice(0, 72) : undefined
+  }))
+
+  if (temPaginacao) {
+    if (paginaValida > 1) rows.push({ id: `barbeiro_pagina_${paginaValida - 1}`, title: "⬅️ Página anterior", description: `Ir para página ${paginaValida - 1}` })
+    if (paginaValida < totalPaginas) rows.push({ id: `barbeiro_pagina_${paginaValida + 1}`, title: "Próxima página ➡️", description: `Ir para página ${paginaValida + 1}` })
+  }
+
+  const buttonText = temPaginacao
+    ? `Ver barbeiros (${paginaValida}/${totalPaginas})`.slice(0, 20)
+    : "Ver barbeiros"
+
+  const bodyText = temPaginacao
+    ? `Escolha seu barbeiro (${paginaValida}/${totalPaginas}):`
+    : "Escolha seu barbeiro:"
+
+  await enviarListaInterativa(
+    phoneNumberId, to,
+    "👨‍🦱 Barbeiros",
+    bodyText,
+    buttonText,
+    "Disponíveis",
+    rows
+  )
 }
 
 function enviarMenuHorarios(): string {

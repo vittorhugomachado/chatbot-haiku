@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(supabase functions:*)",
-      "Bash(npx supabase:*)"
+      "Bash(npx supabase:*)",
+      "Bash(./node_modules/.bin/supabase functions:*)",
+      "Bash(npx supabase@1 functions deploy whatsapp-webhook)"
     ]
   }
 }
