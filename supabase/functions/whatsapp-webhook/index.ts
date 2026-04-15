@@ -1234,10 +1234,9 @@ async function processarComBotoes(
 
     case 'servico': {
       const servicos = await getServicos(barbershopId)
-      const servicoEncontrado = servicos.find((s, i) =>
-        String(i + 1) === texto ||
+      const servicoEncontrado = servicos.find(s =>
         s.id === texto ||
-        s.name.toLowerCase().includes(texto.toLowerCase())
+        s.name.toLowerCase() === texto.toLowerCase()
       )
       if (servicoEncontrado) {
         estado.servico = servicoEncontrado
