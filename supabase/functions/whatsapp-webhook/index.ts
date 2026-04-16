@@ -777,6 +777,51 @@ const supabase = createClient(
 )
 
 // ============================================
+// CONSOLE DE QUERIES
+// ============================================
+
+interface QueryRecord {
+  tabela: string
+  operacao: 'SELECT' | 'INSERT' | 'UPDATE'
+  filtros: string
+  linhas: number
+  duracaoMs: number
+  cached: boolean
+}
+
+let _queryLog: QueryRecord[] = []
+let _conversaCache: { id: string; historic: any[] } | null = null
+
+function iniciarLogRequisicao() {
+  _queryLog = []
+  _conversaCache = null
+}
+
+function registrarQuery(record: QueryRecord) {
+  _queryLog.push(record)
+}
+
+function exibirConsoleQueries(contexto: string) {
+  if (_queryLog.length === 0) return
+  const linhas: string[] = []
+  linhas.push(`╔═══════════════════════════════════════════════════`)
+  linhas.push(`║ 🗄️  BANCO DE DADOS — ${contexto}`)
+  linhas.push(`╠═══════════════════════════════════════════════════`)
+  for (const q of _queryLog) {
+    const icon = q.cached ? '📦' : '🔍'
+    const origem = q.cached ? 'CACHE' : 'DB   '
+    linhas.push(`║ ${icon} ${origem} | ${q.operacao.padEnd(6)} | ${q.tabela.padEnd(30)} | ${String(q.linhas).padStart(3)} linha(s) | ${String(q.duracaoMs).padStart(4)}ms | ${q.filtros}`)
+  }
+  const totalMs = _queryLog.reduce((acc, q) => acc + q.duracaoMs, 0)
+  const dbCount = _queryLog.filter(q => !q.cached).length
+  const cacheCount = _queryLog.filter(q => q.cached).length
+  linhas.push(`╠═══════════════════════════════════════════════════`)
+  linhas.push(`║ Total: ${_queryLog.length} queries | 🔍 ${dbCount} no banco | 📦 ${cacheCount} do cache | ⏱️  ${totalMs}ms`)
+  linhas.push(`╚═══════════════════════════════════════════════════`)
+  console.log(linhas.join('\n'))
+}
+
+// ============================================
 // LOOKUP: phoneNumberId → barbershop
 // ============================================
 
@@ -791,12 +836,17 @@ const BARBERSHOP_CACHE = new Map<string, { data: BarbershopInfo; at: number }>()
 
 async function getBarbershopByPhone(phoneNumberId: string): Promise<BarbershopInfo | null> {
   const cached = BARBERSHOP_CACHE.get(phoneNumberId)
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    registrarQuery({ tabela: 'barbershops', operacao: 'SELECT', filtros: `whatsapp_phone_number_id=${phoneNumberId}`, linhas: 1, duracaoMs: 0, cached: true })
+    return cached.data
+  }
+  const t0 = Date.now()
   const { data, error } = await supabase
     .from("barbershops")
-    .select("id, name")
+    .select("id, name, slug")
     .eq("whatsapp_phone_number_id", phoneNumberId)
     .single()
+  registrarQuery({ tabela: 'barbershops', operacao: 'SELECT', filtros: `whatsapp_phone_number_id=${phoneNumberId}`, linhas: data ? 1 : 0, duracaoMs: Date.now() - t0, cached: false })
   if (error || !data) {
     console.error("[ERRO] getBarbershopByPhone:", phoneNumberId, JSON.stringify(error))
     return null
@@ -821,31 +871,34 @@ const SERVICOS_CACHE = new Map<string, { data: Servico[]; at: number }>()
 
 async function getServicos(barbershopId: string): Promise<Servico[]> {
   const cached = SERVICOS_CACHE.get(barbershopId)
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
-  
-  // Busca serviços que têm pelo menos um barbeiro associado
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    registrarQuery({ tabela: 'services', operacao: 'SELECT', filtros: `barbershop_id=${barbershopId} is_active=true`, linhas: cached.data.length, duracaoMs: 0, cached: true })
+    return cached.data
+  }
+
+  const t0 = Date.now()
   const { data, error } = await supabase
     .from("services")
     .select(`
-      id, 
-      name, 
-      price, 
-      duration_min, 
+      id,
+      name,
+      price,
+      duration_min,
       description,
       barber_services!inner (barber_id)
     `)
     .eq("barbershop_id", barbershopId)
     .eq("is_active", true)
     .order("name")
+  registrarQuery({ tabela: 'services + barber_services', operacao: 'SELECT', filtros: `barbershop_id=${barbershopId} is_active=true`, linhas: (data || []).length, duracaoMs: Date.now() - t0, cached: false })
 
   if (error) {
     console.error("[ERRO] getServicos:", JSON.stringify(error))
     return []
   }
-  
-  // Remove o campo barber_services da resposta (não precisamos dele)
+
   const servicos = (data || []).map(({ barber_services, ...rest }: any) => rest) as Servico[]
-  
+
   SERVICOS_CACHE.set(barbershopId, { data: servicos, at: Date.now() })
   return servicos
 }
@@ -865,13 +918,18 @@ const OPENING_HOURS_CACHE = new Map<string, { data: OpeningHour[]; at: number }>
 
 async function getOpeningHours(barbershopId: string): Promise<OpeningHour[]> {
   const cached = OPENING_HOURS_CACHE.get(barbershopId)
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    registrarQuery({ tabela: 'opening_hours', operacao: 'SELECT', filtros: `barbershop_id=${barbershopId} is_open=true`, linhas: cached.data.length, duracaoMs: 0, cached: true })
+    return cached.data
+  }
+  const t0 = Date.now()
   const { data, error } = await supabase
     .from("opening_hours")
     .select("day_of_week, opens_at, closes_at, period_order")
     .eq("barbershop_id", barbershopId)
     .eq("is_open", true)
     .order("period_order")
+  registrarQuery({ tabela: 'opening_hours', operacao: 'SELECT', filtros: `barbershop_id=${barbershopId} is_open=true`, linhas: (data || []).length, duracaoMs: Date.now() - t0, cached: false })
   if (error) console.error("[ERRO] getOpeningHours:", JSON.stringify(error))
   const hours = (data || []) as OpeningHour[]
   OPENING_HOURS_CACHE.set(barbershopId, { data: hours, at: Date.now() })
@@ -940,8 +998,8 @@ interface Barbeiro {
 
 const BARBEIROS_CACHE = new Map<string, { data: Barbeiro[]; at: number }>()
 
-async function getBarbeiros(barbershopId: string, serviceIds: string[], diaDDMM: string): Promise<Barbeiro[]> {
-  const cacheKey = `${barbershopId}:${[...serviceIds].sort().join(',')}:${diaDDMM}`
+async function getBarbeiros(barbershopId: string, serviceId: string, diaDDMM: string): Promise<Barbeiro[]> {
+  const cacheKey = `${barbershopId}:${serviceId}:${diaDDMM}`
   const cached = BARBEIROS_CACHE.get(cacheKey)
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data
 
@@ -954,63 +1012,46 @@ async function getBarbeiros(barbershopId: string, serviceIds: string[], diaDDMM:
   if (dataAlvo < hoje) dataAlvo = new Date(Date.UTC(year + 1, mm - 1, dd))
   const dayOfWeek = dataAlvo.getUTCDay()
 
-  // Busca barbeiros ativos com disponibilidade no dia
+  // Busca barbeiros ativos com disponibilidade no dia E que realizam o serviço
+  const t0 = Date.now()
   const { data: disponiveis, error: errDisp } = await supabase
     .from('barbers')
-    .select('id, name, description, barber_availability!inner(day_of_week, is_day_off)')
+    .select('id, name, description, barber_availability!inner(day_of_week, is_day_off), barber_services!inner(service_id)')
     .eq('barbershop_id', barbershopId)
     .eq('is_active', true)
     .eq('barber_availability.day_of_week', dayOfWeek)
     .eq('barber_availability.is_day_off', false)
+    .eq('barber_services.service_id', serviceId)
+  registrarQuery({ tabela: 'barbers + barber_availability + barber_services', operacao: 'SELECT', filtros: `barbershop_id=${barbershopId} day_of_week=${dayOfWeek} service_id=${serviceId.slice(0, 8)}...`, linhas: (disponiveis || []).length, duracaoMs: Date.now() - t0, cached: false })
 
   if (errDisp) {
-    console.error('[ERRO] getBarbeiros (disponibilidade):', JSON.stringify(errDisp))
+    console.error('[ERRO] getBarbeiros:', JSON.stringify(errDisp))
     return []
   }
 
-  const disponiveisIds = (disponiveis || []).map((b: any) => b.id)
-  if (disponiveisIds.length === 0) {
-    BARBEIROS_CACHE.set(cacheKey, { data: [], at: Date.now() })
-    return []
-  }
-
-  // Busca quais serviços cada barbeiro realiza
-  const { data: bs, error: errBs } = await supabase
-    .from('barber_services')
-    .select('barber_id, service_id')
-    .in('barber_id', disponiveisIds)
-    .in('service_id', serviceIds)
-
-  if (errBs) {
-    console.error('[ERRO] getBarbeiros (barber_services):', JSON.stringify(errBs))
-    return []
-  }
-
-  // Monta mapa barber_id → conjunto de service_ids que ele realiza
-  const servicosPorBarbeiro = new Map<string, Set<string>>()
-  for (const row of (bs || [])) {
-    if (!servicosPorBarbeiro.has(row.barber_id)) servicosPorBarbeiro.set(row.barber_id, new Set())
-    servicosPorBarbeiro.get(row.barber_id)!.add(row.service_id)
-  }
-
-  // Filtra: barbeiro precisa realizar TODOS os serviços selecionados
-  const result: Barbeiro[] = (disponiveis || [])
-    .filter((b: any) => {
-      const realizados = servicosPorBarbeiro.get(b.id)
-      return serviceIds.every(sid => realizados?.has(sid))
-    })
-    .map((b: any) => ({ id: b.id, name: b.name, description: b.description ?? null }))
+  const result: Barbeiro[] = (disponiveis || []).map((b: any) => ({
+    id: b.id,
+    name: b.name,
+    description: b.description ?? null,
+  }))
 
   BARBEIROS_CACHE.set(cacheKey, { data: result, at: Date.now() })
   return result
 }
 
+interface ServicoAgendado {
+  servico: Servico
+  barbeiro: Barbeiro
+  horario: string
+}
+
 interface EstadoTeste {
   etapa: 'inicio' | 'servico' | 'servico_confirmar' | 'dia' | 'barbeiro' | 'horario' | 'confirmacao' | 'informacoes' | 'listar_agendamentos'
   servicos: Servico[]
+  servicosAgendados: ServicoAgendado[]
+  servicoAtualIndex: number
+  barbeiroAtual?: Barbeiro  // barbeiro escolhido para o serviço atual (aguardando horário)
   dia?: string
-  barbeiro?: Barbeiro
-  horario?: string
   paginaServicos: number
   paginaBarbeiros: number
   jaEnviouBoasVindas: boolean
@@ -1033,6 +1074,7 @@ Deno.serve(async (req) => {
   }
 
   if (req.method === "POST") {
+    iniciarLogRequisicao()
     try {
       const body = await req.json()
       const value = body.entry?.[0]?.changes?.[0]?.value
@@ -1052,15 +1094,6 @@ Deno.serve(async (req) => {
       const phoneNumberId = value.metadata?.phone_number_id || value.phone_number_id //ID DO WHATSAPP DA BARBEARIA
       const nomeCliente = value.contacts?.[0]?.profile?.name || "Cliente" //NOME DO CLIENTE
 
-      // IDENTIFICA A BARBEARIA PELO phoneNumberId
-      const barbearia = await getBarbershopByPhone(phoneNumberId)
-      if (!barbearia) {
-        console.error(`[ERRO] Barbearia não encontrada para phoneNumberId: ${phoneNumberId}`)
-        return new Response("OK", { status: 200 })
-      }
-      const barbershopId = barbearia.id
-      const nomeBarbearia = barbearia.name
-
       let texto = msg.text?.body?.trim() || ""
 
       //DETECTA SE É INTERAÇÃO (clique em botão ou lista)
@@ -1073,11 +1106,21 @@ Deno.serve(async (req) => {
                 texto
       }
 
+      // BUSCA BARBEARIA E ESTADO DA CONVERSA EM PARALELO
+      const [barbearia, estadoInicial] = await Promise.all([
+        getBarbershopByPhone(phoneNumberId),
+        buscarEstadoConversa(from),
+      ])
+      const estado = estadoInicial
+
+      if (!barbearia) {
+        console.error(`[ERRO] Barbearia não encontrada para phoneNumberId: ${phoneNumberId}`)
+        return new Response("OK", { status: 200 })
+      }
+      const barbershopId = barbearia.id
+      const nomeBarbearia = barbearia.name
+
       console.log(`[MSG] ${nomeCliente}: "${texto}" | tipo: ${msg.type} | barbearia: ${nomeBarbearia}`)
-
-      // BUSCA O ESTADO DA CONVERSA NA TABELA conversations_chatbot DO BANCO DE DADOS
-      let estado = await buscarEstadoConversa(from)
-
       console.log(`[ESTADO] etapa: ${estado.etapa}, jaEnviouBoasVindas: ${estado.jaEnviouBoasVindas}`)
 
       // SÓ ENVIA BOAS-VINDAS SE:
@@ -1090,6 +1133,7 @@ Deno.serve(async (req) => {
         estado.jaEnviouBoasVindas = true
         estado.etapa = 'inicio'
         await salvarEstadoConversa(from, estado, phoneNumberId, barbershopId)
+        exibirConsoleQueries(`${nomeCliente} | BOAS-VINDAS | msg: "${texto.slice(0, 40)}"`)
         return new Response("OK", { status: 200 })
       }
 
@@ -1111,9 +1155,12 @@ Deno.serve(async (req) => {
       }
       console.log(`[RESP] → ${from}`)
 
+      exibirConsoleQueries(`${nomeCliente} | etapa: ${estado.etapa} | msg: "${texto.slice(0, 40)}"`)
+
       return new Response("OK", { status: 200 })
     } catch (error) {
       console.error("[ERRO]", error)
+      exibirConsoleQueries("ERRO na requisição")
       return new Response("OK", { status: 200 })
     }
   }
@@ -1126,28 +1173,8 @@ Deno.serve(async (req) => {
 // ============================================
 
 async function buscarEstadoConversa(clienteNumero: string): Promise<EstadoTeste> {
+  const t0 = Date.now()
   const { data } = await supabase
-    .from("conversations_chatbot")
-    .select("historic")
-    .eq("client_phone_number_id", clienteNumero)
-    .eq("status", "em_andamento")
-    .order("updated_at", { ascending: false })
-    .limit(1)
-    .single()
-
-  if (data?.historic && data.historic.length > 0) {
-    // 🔥 CORREÇÃO: busca do FIM para o INÍCIO (estado mais recente)
-    const ultimoEstado = [...data.historic].reverse().find((h: any) => h.tipo === "estado_teste")
-    if (ultimoEstado) {
-      return ultimoEstado.content as EstadoTeste
-    }
-  }
-
-  return { etapa: 'inicio', servicos: [], paginaServicos: 1, paginaBarbeiros: 1, jaEnviouBoasVindas: false }
-}
-
-async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, phoneNumberId: string, barbershopId: string): Promise<void> {
-  const { data: conversa } = await supabase
     .from("conversations_chatbot")
     .select("id, historic")
     .eq("client_phone_number_id", clienteNumero)
@@ -1155,19 +1182,37 @@ async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, 
     .order("updated_at", { ascending: false })
     .limit(1)
     .single()
+  registrarQuery({ tabela: 'conversations_chatbot', operacao: 'SELECT', filtros: `client_phone_number_id=...${clienteNumero.slice(-4)} status=em_andamento`, linhas: data ? 1 : 0, duracaoMs: Date.now() - t0, cached: false })
+
+  // Armazena para reusar no salvar (elimina SELECT duplo)
+  _conversaCache = data ? { id: data.id, historic: data.historic || [] } : null
+
+  if (data?.historic && data.historic.length > 0) {
+    const ultimoEstado = [...data.historic].reverse().find((h: any) => h.tipo === "estado_teste")
+    if (ultimoEstado) {
+      return ultimoEstado.content as EstadoTeste
+    }
+  }
+
+  return { etapa: 'inicio', servicos: [], servicosAgendados: [], servicoAtualIndex: 0, paginaServicos: 1, paginaBarbeiros: 1, jaEnviouBoasVindas: false }
+}
+
+async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, phoneNumberId: string, barbershopId: string): Promise<void> {
+  const conversa = _conversaCache
 
   if (conversa) {
-    const historic = conversa.historic || []
-    // REMOVE todos os estados antigos, mantém apenas o novo
-    const outrosHistoricos = historic.filter((h: any) => h.tipo !== "estado_teste")
+    const outrosHistoricos = conversa.historic.filter((h: any) => h.tipo !== "estado_teste")
     const novoHistorico = [...outrosHistoricos, { role: "system", tipo: "estado_teste", content: estado }]
 
+    const t0 = Date.now()
     const { error } = await supabase
       .from("conversations_chatbot")
       .update({ historic: novoHistorico, updated_at: new Date().toISOString() })
       .eq("id", conversa.id)
+    registrarQuery({ tabela: 'conversations_chatbot', operacao: 'UPDATE', filtros: `id=${conversa.id} etapa→${estado.etapa}`, linhas: 1, duracaoMs: Date.now() - t0, cached: false })
     if (error) console.error("[ERRO] salvarEstado update:", JSON.stringify(error))
   } else {
+    const t0 = Date.now()
     const { error } = await supabase
       .from("conversations_chatbot")
       .insert({
@@ -1177,6 +1222,7 @@ async function salvarEstadoConversa(clienteNumero: string, estado: EstadoTeste, 
         historic: [{ role: "system", tipo: "estado_teste", content: estado }],
         status: "em_andamento",
       })
+    registrarQuery({ tabela: 'conversations_chatbot', operacao: 'INSERT', filtros: `barbershop_id=${barbershopId} novo registro`, linhas: 1, duracaoMs: Date.now() - t0, cached: false })
     if (error) console.error("[ERRO] salvarEstado insert:", JSON.stringify(error))
   }
 }
@@ -1243,18 +1289,20 @@ async function processarComBotoes(
   if (["cancelar", "sair"].includes(texto.toLowerCase())) {
     estado.etapa = 'inicio'
     estado.servicos = []
+    estado.servicosAgendados = []
+    estado.servicoAtualIndex = 0
+    estado.barbeiroAtual = undefined
     estado.dia = undefined
-    estado.barbeiro = undefined
-    estado.horario = undefined
     return "✅ Agendamento cancelado. Digite *AGENDAR* para começar!"
   }
 
   if (["menu", "inicio", "menu inicial"].includes(texto.toLowerCase())) {
     estado.etapa = 'inicio'
     estado.servicos = []
+    estado.servicosAgendados = []
+    estado.servicoAtualIndex = 0
+    estado.barbeiroAtual = undefined
     estado.dia = undefined
-    estado.barbeiro = undefined
-    estado.horario = undefined
     await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
     return null
   }
@@ -1278,20 +1326,41 @@ async function processarComBotoes(
         await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
         return null
       case 'barbeiro':
-        estado.etapa = 'dia'
-        estado.barbeiro = undefined
-        await enviarMenuDias(barbershopId, phoneNumberId, from)
+        if (estado.servicoAtualIndex > 0) {
+          // Volta para o horário do serviço anterior (re-selecionar horário)
+          const anterior = estado.servicosAgendados.pop()!
+          estado.servicoAtualIndex--
+          estado.barbeiroAtual = anterior.barbeiro
+          estado.etapa = 'horario'
+          const servicoAnt = estado.servicos[estado.servicoAtualIndex]
+          return enviarMenuHorarios(servicoAnt.name, anterior.barbeiro.name)
+        } else {
+          // Primeiro serviço → volta para seleção de dia
+          estado.etapa = 'dia'
+          estado.servicosAgendados = []
+          estado.servicoAtualIndex = 0
+          estado.barbeiroAtual = undefined
+          await enviarMenuDias(barbershopId, phoneNumberId, from)
+        }
         return null
-      case 'horario':
+      case 'horario': {
+        // Volta para re-selecionar o barbeiro do serviço atual
         estado.etapa = 'barbeiro'
-        estado.horario = undefined
+        estado.barbeiroAtual = undefined
         estado.paginaBarbeiros = 1
-        await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!, phoneNumberId, from, 1)
+        const servicoAtualV = estado.servicos[estado.servicoAtualIndex]
+        await enviarMenuBarbeiros(barbershopId, servicoAtualV.id, servicoAtualV.name, estado.dia!, phoneNumberId, from, 1, estado.servicoAtualIndex)
         return null
-      case 'confirmacao':
+      }
+      case 'confirmacao': {
+        // Volta para re-selecionar horário do último serviço
+        const ultimoAgendado = estado.servicosAgendados.pop()!
+        estado.servicoAtualIndex = estado.servicosAgendados.length
+        estado.barbeiroAtual = ultimoAgendado.barbeiro
         estado.etapa = 'horario'
-        estado.horario = undefined
-        return enviarMenuHorarios()
+        const ultimoServico = estado.servicos[estado.servicoAtualIndex]
+        return enviarMenuHorarios(ultimoServico.name, ultimoAgendado.barbeiro.name)
+      }
       default:
         await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
         return null
@@ -1303,32 +1372,61 @@ async function processarComBotoes(
   // Se o input pertence a uma etapa anterior, reseta o fluxo para ela
   // ============================================
 
+  // ============================================
+  // DETECÇÃO DE CLIQUE EM MENSAGEM ANTIGA
+  // Reverte o estado para o momento em que o botão foi enviado
+  // ============================================
+
+  // Clicou em barbeiro antigo (formato: brb_{serviceIndex}_{barbeiroId})
+  const brbMatch = texto.match(/^brb_(\d+)_(.+)$/)
+  if (brbMatch && ['horario', 'barbeiro', 'confirmacao'].includes(estado.etapa)) {
+    const targetIndex = parseInt(brbMatch[1], 10)
+    const barbeiroId = brbMatch[2]
+    if (targetIndex < estado.servicos.length) {
+      // Recolhe todos os agendamentos do serviço targetIndex em diante
+      estado.servicosAgendados = estado.servicosAgendados.slice(0, targetIndex)
+      estado.servicoAtualIndex = targetIndex
+      // Busca o barbeiro na lista atual
+      const barbeiros = await getBarbeiros(barbershopId, estado.servicos[targetIndex].id, estado.dia!)
+      const barbeiroEncontrado = barbeiros.find(b => b.id === barbeiroId)
+      if (barbeiroEncontrado) {
+        estado.barbeiroAtual = barbeiroEncontrado
+        estado.etapa = 'horario'
+        const srv = estado.servicos[targetIndex]
+        return enviarMenuHorarios(srv.name, barbeiroEncontrado.name)
+      }
+    }
+  }
+
   // Clicou em serviço antigo (UUID) estando em etapa posterior
   if (!['servico', 'servico_confirmar', 'inicio'].includes(estado.etapa)) {
     const servicos = await getServicos(barbershopId)
     const servicoAntigo = servicos.find(s => s.id === texto)
     if (servicoAntigo) {
       estado.servicos = [servicoAntigo]
+      estado.servicosAgendados = []
+      estado.servicoAtualIndex = 0
+      estado.barbeiroAtual = undefined
       estado.dia = undefined
-      estado.barbeiro = undefined
-      estado.horario = undefined
       estado.etapa = 'servico_confirmar'
       await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
       return null
     }
   }
 
-  // Clicou em dia antigo (DD/MM) estando em etapa posterior (barbeiro, horario, confirmacao)
+  // Clicou em dia antigo (DD/MM) estando em etapa posterior
   if (['barbeiro', 'horario', 'confirmacao'].includes(estado.etapa) && texto.match(/^\d{2}\/\d{2}$/)) {
     const dias = await getDiasDisponiveis(barbershopId)
     const diaAntigo = dias.find(d => d.value === texto)
     if (diaAntigo) {
       estado.dia = diaAntigo.value
-      estado.barbeiro = undefined
-      estado.horario = undefined
+      estado.servicosAgendados = []
+      estado.servicoAtualIndex = 0
+      estado.barbeiroAtual = undefined
       estado.etapa = 'barbeiro'
       estado.paginaBarbeiros = 1
-      await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia, phoneNumberId, from, 1)
+      const primServico = estado.servicos[0]
+      await enviarMenuBarbeiros(barbershopId, primServico.id, primServico.name, estado.dia, phoneNumberId, from, 1, 0)
       return null
     }
   }
@@ -1365,7 +1463,8 @@ async function processarComBotoes(
         await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
         return null
       }
-      return await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1, estado.servicos)
+      await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1, estado.servicos)
+      return null
     }
 
     case 'servico_confirmar': {
@@ -1393,75 +1492,116 @@ async function processarComBotoes(
         estado.dia = diaEncontrado.value
         estado.etapa = 'barbeiro'
         estado.paginaBarbeiros = 1
-        await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia, phoneNumberId, from, 1)
+        estado.servicoAtualIndex = 0
+        estado.servicosAgendados = []
+        estado.barbeiroAtual = undefined
+        const primServico = estado.servicos[0]
+        await enviarMenuBarbeiros(barbershopId, primServico.id, primServico.name, estado.dia, phoneNumberId, from, 1, 0)
         return null
       }
-      return await enviarMenuDias(barbershopId, phoneNumberId, from)
+      await enviarMenuDias(barbershopId, phoneNumberId, from)
+      return null
     }
 
     case 'barbeiro': {
-      // Navegação de página (IDs como "barbeiro_pagina_2")
+      const servicoAtual = estado.servicos[estado.servicoAtualIndex]
+
+      // Navegação de página
       const matchPagBarbeiro = texto.match(/^barbeiro_pagina_(\d+)$/)
       if (matchPagBarbeiro) {
         const novaPag = parseInt(matchPagBarbeiro[1], 10)
         estado.paginaBarbeiros = novaPag
-        await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!, phoneNumberId, from, novaPag)
+        await enviarMenuBarbeiros(barbershopId, servicoAtual.id, servicoAtual.name, estado.dia!, phoneNumberId, from, novaPag, estado.servicoAtualIndex)
         return null
       }
 
-      // Seleção de barbeiro pelo UUID (clique na lista interativa)
-      const barbeiros = await getBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!)
-      const barbeiro = barbeiros.find(b => b.id === texto)
+      // Seleção de barbeiro via brb_{index}_{uuid} (novo formato) ou UUID puro (retrocompat.)
+      const brbSel = texto.match(/^brb_\d+_(.+)$/)
+      const barbeiroIdBuscado = brbSel ? brbSel[1] : texto
+      const barbeiros = await getBarbeiros(barbershopId, servicoAtual.id, estado.dia!)
+      const barbeiro = barbeiros.find(b => b.id === barbeiroIdBuscado)
       if (barbeiro) {
-        estado.barbeiro = barbeiro
+        estado.barbeiroAtual = barbeiro
         estado.etapa = 'horario'
-        return enviarMenuHorarios()
+        return enviarMenuHorarios(servicoAtual.name, barbeiro.name)
       }
 
-      // Texto não reconhecido: reenvia a lista
-      await enviarMenuBarbeiros(barbershopId, estado.servicos.map(s => s.id), estado.dia!, phoneNumberId, from, estado.paginaBarbeiros)
+      // Texto não reconhecido: reenvia a lista do serviço atual
+      await enviarMenuBarbeiros(barbershopId, servicoAtual.id, servicoAtual.name, estado.dia!, phoneNumberId, from, estado.paginaBarbeiros, estado.servicoAtualIndex)
       return null
     }
 
-    case 'horario':
-      const horarioMatch = texto.match(/(\d{1,2})[:h]?(\d{2})?/)
+    case 'horario': {
+      const horarioMatch = texto.match(/^(\d{1,2})[:h]?(\d{2})?$/)
       if (horarioMatch) {
         const hora = horarioMatch[1].padStart(2, '0')
         const minuto = horarioMatch[2] || "00"
-        estado.horario = `${hora}:${minuto}`
-        estado.etapa = 'confirmacao'
-        return mensagemConfirmacao(estado, nomeCliente)
+        const horario = `${hora}:${minuto}`
+        const servicoAtualH = estado.servicos[estado.servicoAtualIndex]
+
+        // Salva o par (serviço, barbeiro, horário)
+        estado.servicosAgendados.push({ servico: servicoAtualH, barbeiro: estado.barbeiroAtual!, horario })
+        estado.barbeiroAtual = undefined
+
+        const proximoIndex = estado.servicoAtualIndex + 1
+        if (proximoIndex < estado.servicos.length) {
+          // Ainda há serviços → vai para barbeiro do próximo
+          estado.servicoAtualIndex = proximoIndex
+          estado.paginaBarbeiros = 1
+          estado.etapa = 'barbeiro'
+          const proximoServico = estado.servicos[proximoIndex]
+          await enviarMenuBarbeiros(barbershopId, proximoServico.id, proximoServico.name, estado.dia!, phoneNumberId, from, 1, proximoIndex)
+          return null
+        } else {
+          // Todos os serviços prontos → confirmação
+          estado.etapa = 'confirmacao'
+          return mensagemConfirmacao(estado, nomeCliente)
+        }
       }
       return "❓ Digite um horário válido (ex: 14h, 14:30, 15)"
+    }
 
     case 'confirmacao':
       if (texto.toLowerCase() === "sim" || texto.toLowerCase() === "confirmar" || texto.toLowerCase() === "ok") {
-        const listaServicos = estado.servicos.map(s => `  • ${s.name} — R$ ${Number(s.price).toFixed(2).replace('.', ',')}`).join('\n')
-        const totalValor = estado.servicos.reduce((acc, s) => acc + Number(s.price), 0)
+        const manualCustomerId = await buscarOuCriarCliente(barbershopId, nomeCliente, from)
+        const resultado = await criarAgendamentos(barbershopId, estado, manualCustomerId, nomeCliente)
+
+        if (!resultado.success) {
+          await enviarBotoesErroNoAgendamento(phoneNumberId, from)
+          estado.etapa = 'inicio'
+          return
+        }
+
+        const linhasServicos = estado.servicosAgendados.map(sa =>
+          `  • ${sa.servico.name} c/ *${sa.barbeiro.name}* — ${sa.horario} — R$ ${Number(sa.servico.price).toFixed(2).replace('.', ',')}`
+        ).join('\n')
+        const totalValor = estado.servicosAgendados.reduce((acc, sa) => acc + Number(sa.servico.price), 0)
         const msg = `✅ *AGENDADO!*\n\n` +
-          `*Serviços:*\n${listaServicos}\n` +
-          `*Total: R$ ${totalValor.toFixed(2).replace('.', ',')}*\n\n` +
-          `• Barbeiro: ${estado.barbeiro?.name}\n` +
-          `• Data: ${estado.dia}\n` +
-          `• Horário: ${estado.horario}\n\n` +
+          `*Serviços:*\n${linhasServicos}\n\n` +
+          `*Total: R$ ${totalValor.toFixed(2).replace('.', ',')}*\n` +
+          `📅 ${estado.dia}\n\n` +
           `Te esperamos! 💈`
 
         estado.etapa = 'inicio'
         estado.servicos = []
+        estado.servicosAgendados = []
+        estado.servicoAtualIndex = 0
+        estado.barbeiroAtual = undefined
         estado.dia = undefined
-        estado.barbeiro = undefined
-        estado.horario = undefined
 
         return msg
       }
-      
+
       if (texto.toLowerCase() === "nao" || texto.toLowerCase() === "cancelar") {
         estado.etapa = 'servico'
         estado.servicos = []
+        estado.servicosAgendados = []
+        estado.servicoAtualIndex = 0
+        estado.barbeiroAtual = undefined
         await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
         return null
       }
-      
+
       return "❓ Confirme com *SIM* ou *NAO*"
   }
 
@@ -1587,16 +1727,18 @@ async function enviarMenuDias(barbershopId: string, phoneNumberId: string, to: s
 
 async function enviarMenuBarbeiros(
   barbershopId: string,
-  serviceIds: string[],
+  serviceId: string,
+  nomeServico: string,
   diaDDMM: string,
   phoneNumberId: string,
   to: string,
-  pagina = 1
+  pagina = 1,
+  serviceIndex = 0
 ): Promise<void> {
-  const barbeiros = await getBarbeiros(barbershopId, serviceIds, diaDDMM)
+  const barbeiros = await getBarbeiros(barbershopId, serviceId, diaDDMM)
 
   if (barbeiros.length === 0) {
-    await enviarWhatsApp(phoneNumberId, to, "😕 Nenhum barbeiro disponível para os serviços e dia selecionados. Tente outro dia.")
+    await enviarWhatsApp(phoneNumberId, to, `😕 Nenhum profissional disponível para *${nomeServico}* neste dia. Tente outro dia.`)
     return
   }
 
@@ -1607,8 +1749,9 @@ async function enviarMenuBarbeiros(
   const inicio = (paginaValida - 1) * ITEMS_POR_PAGINA
   const barbeirosPagina = barbeiros.slice(inicio, inicio + ITEMS_POR_PAGINA)
 
+  // ID formato brb_{serviceIndex}_{barbeiroId} — permite reverter estado ao clicar em mensagem antiga
   const rows: { id: string; title: string; description?: string }[] = barbeirosPagina.map(b => ({
-    id: b.id,
+    id: `brb_${serviceIndex}_${b.id}`,
     title: b.name.slice(0, 24),
     description: b.description ? b.description.slice(0, 72) : undefined
   }))
@@ -1622,13 +1765,14 @@ async function enviarMenuBarbeiros(
     ? `Ver barbeiros (${paginaValida}/${totalPaginas})`.slice(0, 20)
     : "Ver barbeiros"
 
+  const nomeServicoFmt = nomeServico.slice(0, 20)
   const bodyText = temPaginacao
-    ? `Escolha seu barbeiro (${paginaValida}/${totalPaginas}):`
-    : "Escolha seu barbeiro:"
+    ? `Profissional para *${nomeServicoFmt}* (${paginaValida}/${totalPaginas}):`
+    : `Escolha o profissional para *${nomeServicoFmt}*:`
 
   await enviarListaInterativa(
     phoneNumberId, to,
-    "👨‍🦱 Barbeiros",
+    `✂️ ${nomeServicoFmt}`,
     bodyText,
     buttonText,
     "Disponíveis",
@@ -1636,23 +1780,105 @@ async function enviarMenuBarbeiros(
   )
 }
 
-function enviarMenuHorarios(): string {
-  return `⏰ *QUAL HORÁRIO?*\n\n` +
+function enviarMenuHorarios(nomeServico: string, nomeBarbeiro: string): string {
+  return `⏰ *HORÁRIO — ${nomeServico} c/ ${nomeBarbeiro}*\n\n` +
     `Funcionamento: 08:00 às 20:00\n\n` +
     `Digite o horário (ex: 14h, 14:30, 15)\n\n` +
-    `_Digite CANCELAR_`
+    `_Digite VOLTAR ou CANCELAR_`
 }
 
 function mensagemConfirmacao(estado: EstadoTeste, nomeCliente: string): string {
-  const listaServicos = estado.servicos.map(s => `  • ${s.name} — R$ ${Number(s.price).toFixed(2).replace('.', ',')}`).join('\n')
-  const totalValor = estado.servicos.reduce((acc, s) => acc + Number(s.price), 0)
+  const linhasServicos = estado.servicosAgendados.map(sa =>
+    `  • ${sa.servico.name} c/ *${sa.barbeiro.name}* — ${sa.horario} — R$ ${Number(sa.servico.price).toFixed(2).replace('.', ',')}`
+  ).join('\n')
+  const totalValor = estado.servicosAgendados.reduce((acc, sa) => acc + Number(sa.servico.price), 0)
   return `📋 *CONFIRMAR*\n\n` +
-    `👤 ${nomeCliente}\n` +
-    `✂️ *Serviços:*\n${listaServicos}\n` +
-    `💰 *Total: R$ ${totalValor.toFixed(2).replace('.', ',')}*\n\n` +
-    `👨‍🦱 ${estado.barbeiro?.name}\n` +
-    `📅 ${estado.dia} às ${estado.horario}\n\n` +
+    `👤 ${nomeCliente}\n\n` +
+    `✂️ *Serviços:*\n${linhasServicos}\n\n` +
+    `💰 *Total: R$ ${totalValor.toFixed(2).replace('.', ',')}*\n` +
+    `📅 ${estado.dia}\n\n` +
     `Digite *SIM* ou *NAO*`
+}
+
+// ============================================
+// AGENDAMENTO NO BANCO
+// ============================================
+
+async function buscarOuCriarCliente(barbershopId: string, nomeCliente: string, telefone: string): Promise<string | null> {
+  const { data: existente } = await supabase
+    .from("customers")
+    .select("id")
+    .eq("barbershop_id", barbershopId)
+    .eq("phone", telefone)
+    .single()
+
+  if (existente) return existente.id
+
+  const { data: novo, error } = await supabase
+    .from("customers")
+    .insert({ barbershop_id: barbershopId, name: nomeCliente, phone: telefone })
+    .select("id")
+    .single()
+
+  if (error) {
+    console.error("[ERRO] buscarOuCriarCliente:", JSON.stringify(error))
+    return null
+  }
+  return novo?.id || null
+}
+
+async function criarAgendamentos(
+  barbershopId: string,
+  estado: EstadoTeste,
+  manualCustomerId: string | null,
+  nomeCliente: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const [dd, mm] = estado.dia!.split('/').map(Number)
+    const now = new Date()
+    let year = now.getUTCFullYear()
+    let dataAlvo = new Date(Date.UTC(year, mm - 1, dd))
+    const hoje = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+    if (dataAlvo < hoje) dataAlvo = new Date(Date.UTC(year + 1, mm - 1, dd))
+
+    // Cada serviço tem seu próprio horário → um registro independente no banco
+    const registros = estado.servicosAgendados.map(sa => {
+      const [hh, min] = sa.horario.split(':').map(Number)
+      // Horário digitado em Brasilia (UTC-3) → UTC (+3h)
+      const startsAtUTC = new Date(Date.UTC(
+        dataAlvo.getUTCFullYear(), dataAlvo.getUTCMonth(), dataAlvo.getUTCDate(),
+        hh + 3, min, 0
+      ))
+      const duracaoMin = Number(sa.servico.duration_min) || 30
+      const endsAtUTC = new Date(startsAtUTC.getTime() + duracaoMin * 60000)
+      return {
+        barbershop_id: barbershopId,
+        barber_id: sa.barbeiro.id,
+        service_id: sa.servico.id,
+        manual_customer_id: manualCustomerId,
+        service_name: sa.servico.name,
+        service_price: sa.servico.price,
+        service_duration: duracaoMin,
+        barber_name: sa.barbeiro.name,
+        customer_name: nomeCliente,
+        starts_at: startsAtUTC.toISOString(),
+        ends_at: endsAtUTC.toISOString(),
+        status: 'scheduled',
+      }
+    })
+
+    const { error } = await supabase.from("appointments").insert(registros)
+    if (error) {
+      console.error("[ERRO] criarAgendamentos:", JSON.stringify(error))
+      return { success: false, error: "Erro ao salvar. Tente novamente." }
+    }
+
+    console.log(`[AGENDAMENTO] ${registros.length} registro(s) | ${nomeCliente} | ${estado.dia} | ${estado.servicosAgendados.map(sa => `${sa.servico.name} c/ ${sa.barbeiro.name} ${sa.horario}`).join(', ')}`)
+    return { success: true }
+  } catch (err) {
+    console.error("[ERRO] criarAgendamentos:", err)
+    return { success: false, error: "Erro inesperado." }
+  }
 }
 
 // ============================================
@@ -1820,5 +2046,45 @@ async function enviarWhatsApp(phoneNumberId: string, to: string, texto: string):
     if (result.error) console.error("[ERRO] enviarWhatsApp:", JSON.stringify(result.error))
   } catch (err) {
     console.error("[ERRO] enviarWhatsApp:", err)
+  }
+}
+
+async function enviarBotoesErroNoAgendamento(phoneNumberId: string, to: string): Promise<void> {
+  const token = Deno.env.get("WHATSAPP_TOKEN")
+  if (!token) return
+
+  const barbearia = await getBarbershopByPhone(phoneNumberId)
+  const slug = barbearia?.slug?.toLowerCase().replace(/\s+/g, '-') || "barbearia"
+
+  const body = "❌ *Não foi possível confirmar o agendamento.*\n\nTente novamente mais tarde ou agende pela nossa página:"
+
+  const payload = {
+    messaging_product: "whatsapp", 
+    to: to,                     
+    type: "interactive",
+    interactive: {
+      type: "cta_url",  
+      body: { text: body },
+      action: {
+        name: "cta_url",      
+        parameters: {
+          display_text: "Acessar página", 
+          url: `https://virtualbarber.com.br/${slug}`
+        }
+      }
+    }
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v22.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    const result = await response.json()
+    if (result.error) console.error("[ERRO] enviarBotoesErroNoAgendamento:", JSON.stringify(result.error))
+    else console.log("[CTA] Botão de URL enviado com sucesso")
+  } catch (err) {
+    console.error("[ERRO] enviarBotoesErroNoAgendamento:", err)
   }
 }
