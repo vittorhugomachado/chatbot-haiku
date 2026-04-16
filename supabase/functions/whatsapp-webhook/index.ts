@@ -782,7 +782,7 @@ const supabase = createClient(
 
 interface QueryRecord {
   tabela: string
-  operacao: 'SELECT' | 'INSERT' | 'UPDATE'
+  operacao: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE'
   filtros: string
   linhas: number
   duracaoMs: number
@@ -827,7 +827,8 @@ function exibirConsoleQueries(contexto: string) {
 
 interface BarbershopInfo {
   id: string
-  name: string
+  name: string,
+  slug?: string 
 }
 
 const CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutos
@@ -911,6 +912,7 @@ interface OpeningHour {
   day_of_week: number
   opens_at: string
   closes_at: string
+  is_open: boolean
   period_order: number
 }
 
@@ -1333,31 +1335,45 @@ async function processarComBotoes(
 
   if (texto.toLowerCase() === "voltar") {
     switch (estado.etapa) {
+      
       case 'servico':
         estado.etapa = 'inicio'
         estado.servicos = []
         await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
         return null
+
       case 'servico_confirmar':
         // Remove o último serviço adicionado e volta para a lista
         estado.servicos.pop()
         estado.etapa = 'servico'
         await enviarMenuServicos(barbershopId, phoneNumberId, from, estado.paginaServicos || 1)
-        return null
+        return 
+        
       case 'dia':
         estado.etapa = 'servico_confirmar'
         estado.dia = undefined
         await enviarBotoesAdicionarServico(phoneNumberId, from, estado.servicos)
         return null
+
       case 'barbeiro':
         if (estado.servicoAtualIndex > 0) {
-          // Volta para o horário do serviço anterior (re-selecionar horário)
+          // Volta para o horário do serviço anterior
           const anterior = estado.servicosAgendados.pop()!
           estado.servicoAtualIndex--
           estado.barbeiroAtual = anterior.barbeiro
           estado.etapa = 'horario'
           const servicoAnt = estado.servicos[estado.servicoAtualIndex]
-          return enviarMenuHorarios(servicoAnt.name, anterior.barbeiro.name)
+          await enviarMenuHorarios(
+            barbershopId,
+            anterior.barbeiro.id,      // ✅ barberId (1º argumento)
+            phoneNumberId,              // ✅ phoneNumberId (2º)
+            from,                       // ✅ to (3º)
+            servicoAnt.name,            // ✅ nomeServico (4º)
+            anterior.barbeiro.name,     // ✅ nomeBarbeiro (5º)
+            estado.dia!,                // ✅ diaDDMM (6º)
+            estado.servicoAtualIndex    // ✅ serviceIndex (7º)
+          )
+          return null
         } else {
           // Primeiro serviço → volta para seleção de dia
           estado.etapa = 'dia'
@@ -1365,8 +1381,9 @@ async function processarComBotoes(
           estado.servicoAtualIndex = 0
           estado.barbeiroAtual = undefined
           await enviarMenuDias(barbershopId, phoneNumberId, from)
+          return null
         }
-        return null
+        
       case 'horario': {
         // Volta para re-selecionar o barbeiro do serviço atual
         estado.etapa = 'barbeiro'
@@ -1376,6 +1393,7 @@ async function processarComBotoes(
         await enviarMenuBarbeiros(barbershopId, servicoAtualV.id, servicoAtualV.name, estado.dia!, phoneNumberId, from, 1, estado.servicoAtualIndex)
         return null
       }
+
       case 'confirmacao': {
         // Volta para re-selecionar horário do último serviço
         const ultimoAgendado = estado.servicosAgendados.pop()!
@@ -1383,8 +1401,19 @@ async function processarComBotoes(
         estado.barbeiroAtual = ultimoAgendado.barbeiro
         estado.etapa = 'horario'
         const ultimoServico = estado.servicos[estado.servicoAtualIndex]
-        return enviarMenuHorarios(ultimoServico.name, ultimoAgendado.barbeiro.name)
+        await enviarMenuHorarios(
+          barbershopId,
+          ultimoAgendado.barbeiro.id,  // ✅ barberId (1º)
+          phoneNumberId,                // ✅ phoneNumberId (2º)
+          from,                         // ✅ to (3º)
+          ultimoServico.name,           // ✅ nomeServico (4º)
+          ultimoAgendado.barbeiro.name, // ✅ nomeBarbeiro (5º)
+          estado.dia!,                  // ✅ diaDDMM (6º)
+          estado.servicoAtualIndex      // ✅ serviceIndex (7º)
+        )
+        return null
       }
+
       default:
         await enviarBotoesIniciais(phoneNumberId, (await getBarbershopByPhone(phoneNumberId))?.name ?? "Barbearia", from, nomeCliente)
         return null
@@ -1407,17 +1436,25 @@ async function processarComBotoes(
     const targetIndex = parseInt(brbMatch[1], 10)
     const barbeiroId = brbMatch[2]
     if (targetIndex < estado.servicos.length) {
-      // Recolhe todos os agendamentos do serviço targetIndex em diante
       estado.servicosAgendados = estado.servicosAgendados.slice(0, targetIndex)
       estado.servicoAtualIndex = targetIndex
-      // Busca o barbeiro na lista atual
       const barbeiros = await getBarbeiros(barbershopId, estado.servicos[targetIndex].id, estado.dia!)
       const barbeiroEncontrado = barbeiros.find(b => b.id === barbeiroId)
       if (barbeiroEncontrado) {
         estado.barbeiroAtual = barbeiroEncontrado
         estado.etapa = 'horario'
-        const srv = estado.servicos[targetIndex]
-        return enviarMenuHorarios(srv.name, barbeiroEncontrado.name)
+        const srv = estado.servicos[targetIndex]  // ← pega o serviço correto
+        await enviarMenuHorarios(
+          barbershopId,
+          barbeiroEncontrado.id,
+          phoneNumberId,
+          from,
+          srv.name,
+          barbeiroEncontrado.name,
+          estado.dia!,
+          targetIndex
+        )
+        return null
       }
     }
   }
@@ -1547,7 +1584,18 @@ async function processarComBotoes(
       if (barbeiro) {
         estado.barbeiroAtual = barbeiro
         estado.etapa = 'horario'
-        return enviarMenuHorarios(servicoAtual.name, barbeiro.name)
+        // 🔥 CORRIGIDO: usa servicoAtual.name e barbeiro.name
+        await enviarMenuHorarios(
+          barbershopId,
+          barbeiro.id,  // ← ADICIONAR barberId
+          phoneNumberId,
+          from,
+          servicoAtual.name,
+          barbeiro.name,
+          estado.dia!,
+          estado.servicoAtualIndex
+        )
+        return null
       }
 
       // Texto não reconhecido: reenvia a lista do serviço atual
@@ -1561,26 +1609,19 @@ async function processarComBotoes(
         const hora = horarioMatch[1].padStart(2, '0')
         const minuto = horarioMatch[2] || "00"
         const horario = `${hora}:${minuto}`
-        const servicoAtualH = estado.servicos[estado.servicoAtualIndex]
-
-        // Salva o par (serviço, barbeiro, horário)
-        estado.servicosAgendados.push({ servico: servicoAtualH, barbeiro: estado.barbeiroAtual!, horario })
-        estado.barbeiroAtual = undefined
-
-        const proximoIndex = estado.servicoAtualIndex + 1
-        if (proximoIndex < estado.servicos.length) {
-          // Ainda há serviços → vai para barbeiro do próximo
-          estado.servicoAtualIndex = proximoIndex
-          estado.paginaBarbeiros = 1
-          estado.etapa = 'barbeiro'
-          const proximoServico = estado.servicos[proximoIndex]
-          await enviarMenuBarbeiros(barbershopId, proximoServico.id, proximoServico.name, estado.dia!, phoneNumberId, from, 1, proximoIndex)
-          return null
-        } else {
-          // Todos os serviços prontos → confirmação
-          estado.etapa = 'confirmacao'
-          return mensagemConfirmacao(estado, nomeCliente)
+        
+        // 🔥 VALIDA COM O BARBEIRO ATUAL
+        const validacao = await validarHorario(
+          barbershopId, 
+          estado.barbeiroAtual!.id,  // ← PASSA O ID DO BARBEIRO
+          estado.dia!, 
+          horario
+        )
+        if (!validacao.valido) {
+          return validacao.mensagem || "Horário inválido. Tente novamente."
         }
+        
+        // ... resto do código
       }
       return "❓ Digite um horário válido (ex: 14h, 14:30, 15)"
     }
@@ -1807,12 +1848,12 @@ async function enviarMenuBarbeiros(
   )
 }
 
-function enviarMenuHorarios(nomeServico: string, nomeBarbeiro: string): string {
-  return `⏰ *HORÁRIO — ${nomeServico} c/ ${nomeBarbeiro}*\n\n` +
-    `Funcionamento: 08:00 às 20:00\n\n` +
-    `Digite o horário (ex: 14h, 14:30, 15)\n\n` +
-    `_Digite VOLTAR ou CANCELAR_`
-}
+// function enviarMenuHorarios(nomeServico: string, nomeBarbeiro: string): string {
+//   return `⏰ *HORÁRIO — ${nomeServico} c/ ${nomeBarbeiro}*\n\n` +
+//     `Funcionamento: 08:00 às 20:00\n\n` +
+//     `Digite o horário (ex: 14h, 14:30, 15)\n\n` +
+//     `_Digite VOLTAR ou CANCELAR_`
+// }
 
 function mensagemConfirmacao(estado: EstadoTeste, nomeCliente: string): string {
   const linhasServicos = estado.servicosAgendados.map(sa =>
@@ -2114,4 +2155,329 @@ async function enviarBotoesErroNoAgendamento(phoneNumberId: string, to: string):
   } catch (err) {
     console.error("[ERRO] enviarBotoesErroNoAgendamento:", err)
   }
+}
+
+
+function gerarSlotsHorarios(opensAt: string, closesAt: string): string[] {
+  const slots: string[] = []
+  
+  const [openHour, openMin] = opensAt.split(':').map(Number)
+  const [closeHour, closeMin] = closesAt.split(':').map(Number)
+  
+  let currentHour = openHour
+  let currentMin = openMin
+  
+  while (currentHour < closeHour || (currentHour === closeHour && currentMin < closeMin)) {
+    const horaStr = `${String(currentHour).padStart(2, '0')}:${String(currentMin).padStart(2, '0')}`
+    slots.push(horaStr)
+    
+    currentMin += 30
+    if (currentMin >= 60) {
+      currentHour++
+      currentMin -= 60
+    }
+  }
+  
+  return slots
+}
+
+
+async function getHorariosDoDia(barbershopId: string, diaDDMM: string): Promise<{ opens_at: string; closes_at: string }[]> {
+  // Converte DD/MM para day_of_week
+  const [dd, mm] = diaDDMM.split('/').map(Number)
+  const now = new Date()
+  let year = now.getUTCFullYear()
+  let dataAlvo = new Date(Date.UTC(year, mm - 1, dd))
+  const hoje = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+  if (dataAlvo < hoje) dataAlvo = new Date(Date.UTC(year + 1, mm - 1, dd))
+  const dayOfWeek = dataAlvo.getUTCDay()
+  
+  const t0 = Date.now()
+  const { data, error } = await supabase
+    .from("opening_hours")
+    .select("opens_at, closes_at")
+    .eq("barbershop_id", barbershopId)
+    .eq("day_of_week", dayOfWeek)
+    .eq("is_open", true)
+    .order("period_order")
+  
+  registrarQuery({ 
+    tabela: 'opening_hours', 
+    operacao: 'SELECT', 
+    filtros: `barbershop_id=${barbershopId} day_of_week=${dayOfWeek} is_open=true`, 
+    linhas: (data || []).length, 
+    duracaoMs: Date.now() - t0, 
+    cached: false 
+  })
+  
+  if (error) {
+    console.error("[ERRO] getHorariosDoDia:", JSON.stringify(error))
+    return []
+  }
+  
+  return (data || []) as { opens_at: string; closes_at: string }[]
+}
+
+async function enviarMenuHorarios(
+  barbershopId: string,
+  barberId: string,
+  phoneNumberId: string,
+  to: string,
+  nomeServico: string,
+  nomeBarbeiro: string,
+  diaDDMM: string,
+  serviceIndex: number
+): Promise<void> {
+  const { slots, slotsOcupados } = await gerarSlotsComFiltros(barbershopId, barberId, diaDDMM)
+  
+  if (slots.length === 0 && slotsOcupados.length === 0) {
+    await enviarWhatsApp(phoneNumberId, to, "😕 Nenhum horário disponível para este barbeiro neste dia. Tente outro dia ou outro profissional.")
+    return
+  }
+
+  // Junta todos os slots (livres + ocupados) e ordena
+  const todosSlots = [...slots, ...slotsOcupados].sort()
+  const slotsOcupadosSet = new Set(slotsOcupados)
+
+  let mensagem = `⏰ *HORÁRIOS DISPONÍVEIS — ${nomeServico} c/ ${nomeBarbeiro}*\n\n`
+
+  if (todosSlots.length > 20) {
+    // Formato compacto com faixas
+    const faixasLivres = compactarSlots(slots)
+    const faixasOcupadas = compactarSlots(slotsOcupados)
+    
+    if (faixasLivres) {
+      mensagem += `*Horários livres:* ${faixasLivres}\n\n`
+    }
+    if (faixasOcupadas) {
+      mensagem += `~Horários ocupados: ${faixasOcupadas}~\n\n`
+    }
+    mensagem += `Digite o horário desejado (ex: 14h, 14:30, 15)`
+  } else {
+    // Lista todos os slots (ocupados com tachado)
+    mensagem += `Horários disponíveis:\n`
+    const linhas = todosSlots.map(slot => {
+      if (slotsOcupadosSet.has(slot)) {
+        return `• ~${slot}~ (ocupado)`
+      }
+      return `• ${slot}`
+    }).join('\n')
+    mensagem += `${linhas}\n\n`
+    mensagem += `Digite o horário desejado (ex: 14h, 14:30, 15)`
+  }
+  
+  mensagem += `\n\n_Digite VOLTAR ou CANCELAR_`
+  
+  await enviarWhatsApp(phoneNumberId, to, mensagem)
+}
+
+function compactarSlots(slots: string[]): string {
+  if (slots.length === 0) return ""
+  
+  const faixas: string[] = []
+  let inicio = slots[0]
+  let ultimo = slots[0]
+  
+  for (let i = 1; i < slots.length; i++) {
+    const [hAnt, mAnt] = ultimo.split(':').map(Number)
+    const [hAtual, mAtual] = slots[i].split(':').map(Number)
+    
+    const diffMinutos = (hAtual * 60 + mAtual) - (hAnt * 60 + mAnt)
+    
+    if (diffMinutos === 30) {
+      // Continua a faixa
+      ultimo = slots[i]
+    } else {
+      // Finaliza a faixa atual
+      faixas.push(inicio === ultimo ? inicio : `${inicio}-${ultimo}`)
+      inicio = slots[i]
+      ultimo = slots[i]
+    }
+  }
+  faixas.push(inicio === ultimo ? inicio : `${inicio}-${ultimo}`)
+  
+  return faixas.join(", ")
+}
+
+
+async function validarHorario(
+  barbershopId: string,
+  barberId: string,
+  diaDDMM: string,
+  horarioDigitado: string
+): Promise<{ valido: boolean; mensagem?: string }> {
+  const [hh, mm] = horarioDigitado.split(':').map(Number)
+  
+  if (isNaN(hh) || (mm !== undefined && isNaN(mm))) {
+    return { valido: false, mensagem: "Formato inválido. Use 14h, 14:30 ou 15" }
+  }
+  
+  const horaFormatada = `${String(hh).padStart(2, '0')}:${String(mm || 0).padStart(2, '0')}`
+  
+  const { slots, slotsOcupados } = await gerarSlotsComFiltros(barbershopId, barberId, diaDDMM)
+  
+  if (slots.includes(horaFormatada)) {
+    return { valido: true }
+  }
+  
+  if (slotsOcupados.includes(horaFormatada)) {
+    return { valido: false, mensagem: `⚠️ Horário ${horaFormatada} já está ocupado. Escolha outro horário.` }
+  }
+  
+  // Sugere horários próximos disponíveis
+  const sugestoes = slots.slice(0, 5).join(", ")
+  return { 
+    valido: false, 
+    mensagem: `Horário inválido. Horários disponíveis: ${sugestoes || "nenhum disponível"}...` 
+  }
+}
+
+// ============================================
+// BUSCAR DISPONIBILIDADE DO BARBEIRO POR DIA
+// ============================================
+
+interface BarberAvailability {
+  starts_at: string | null
+  ends_at: string | null
+  use_custom_hours: boolean
+  is_day_off: boolean
+}
+
+async function getBarberAvailability(
+  barbershopId: string,
+  barberId: string,
+  dayOfWeek: number
+): Promise<{ starts_at: string; ends_at: string } | null> {
+  const { data, error } = await supabase
+    .from("barber_availability")
+    .select("starts_at, ends_at, use_custom_hours, is_day_off")
+    .eq("barbershop_id", barbershopId)
+    .eq("barber_id", barberId)
+    .eq("day_of_week", dayOfWeek)
+    .single()
+
+  if (error || !data) {
+    console.error("[ERRO] getBarberAvailability:", error)
+    return null
+  }
+
+  if (data.is_day_off) return null
+  
+  // Se usa horário personalizado e tem horários definidos
+  if (data.use_custom_hours && data.starts_at && data.ends_at) {
+    return { starts_at: data.starts_at, ends_at: data.ends_at }
+  }
+  
+  // Se não usa horário personalizado, retorna null (usa horário da barbearia)
+  return null
+}
+
+// ============================================
+// BUSCAR AGENDAMENTOS DO BARBEIRO NO DIA
+// ============================================
+
+async function getAppointmentsByBarberAndDay(
+  barbershopId: string,
+  barberId: string,
+  dataAlvo: Date
+): Promise<Array<{ starts_at: Date; ends_at: Date }>> {
+  const startOfDay = new Date(dataAlvo)
+  startOfDay.setUTCHours(0, 0, 0, 0)
+  
+  const endOfDay = new Date(dataAlvo)
+  endOfDay.setUTCHours(23, 59, 59, 999)
+
+  const { data, error } = await supabase
+    .from("appointments")
+    .select("starts_at, ends_at")
+    .eq("barbershop_id", barbershopId)
+    .eq("barber_id", barberId)
+    .not("status", "in", "(cancelled_by_customer,cancelled_by_barbershop)")
+    .gte("starts_at", startOfDay.toISOString())
+    .lte("starts_at", endOfDay.toISOString())
+
+  if (error) {
+    console.error("[ERRO] getAppointmentsByBarberAndDay:", error)
+    return []
+  }
+
+  return (data || []).map(a => ({
+    starts_at: new Date(a.starts_at),
+    ends_at: new Date(a.ends_at)
+  }))
+}
+
+async function gerarSlotsComFiltros(
+  barbershopId: string,
+  barberId: string,
+  diaDDMM: string
+): Promise<{ slots: string[]; slotsOcupados: string[] }> {
+  // 1. Converte DD/MM para day_of_week e data
+  const [dd, mm] = diaDDMM.split('/').map(Number)
+  const now = new Date()
+  let year = now.getUTCFullYear()
+  let dataAlvo = new Date(Date.UTC(year, mm - 1, dd))
+  const hoje = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+  if (dataAlvo < hoje) dataAlvo = new Date(Date.UTC(year + 1, mm - 1, dd))
+  const dayOfWeek = dataAlvo.getUTCDay()
+
+  // 2. Busca horário de funcionamento da barbearia
+  const openingHours = await getOpeningHours(barbershopId)
+  const horariosBarbearia = openingHours
+    .filter(h => h.day_of_week === dayOfWeek && h.is_open)
+    .map(h => ({ opens_at: h.opens_at, closes_at: h.closes_at }))
+
+  if (horariosBarbearia.length === 0) {
+    return { slots: [], slotsOcupados: [] }
+  }
+
+  // 3. Busca disponibilidade personalizada do barbeiro
+  const barberAvailability = await getBarberAvailability(barbershopId, barberId, dayOfWeek)
+  
+  // 4. Define os períodos a serem usados (barbeiro ou barbearia)
+  let periodos: { opens_at: string; closes_at: string }[] = []
+  if (barberAvailability) {
+    // Usa horário personalizado do barbeiro
+    periodos = [{
+      opens_at: barberAvailability.starts_at,
+      closes_at: barberAvailability.ends_at
+    }]
+  } else {
+    // Usa horário da barbearia
+    periodos = horariosBarbearia
+  }
+
+  // 5. Gera todos os slots de 30 minutos
+  let todosSlots: string[] = []
+  for (const periodo of periodos) {
+    const slots = gerarSlotsHorarios(periodo.opens_at, periodo.closes_at)
+    todosSlots = [...todosSlots, ...slots]
+  }
+  todosSlots = [...new Set(todosSlots)].sort()
+
+  // 6. Busca agendamentos do barbeiro no dia
+  const appointments = await getAppointmentsByBarberAndDay(barbershopId, barberId, dataAlvo)
+
+  // 7. Filtra slots ocupados por agendamentos
+  const slotsOcupados: string[] = []
+  const slotsLivres: string[] = []
+
+  for (const slot of todosSlots) {
+    const [slotHour, slotMin] = slot.split(':').map(Number)
+    const slotInicio = new Date(dataAlvo)
+    slotInicio.setUTCHours(slotHour, slotMin, 0, 0)
+    const slotFim = new Date(slotInicio.getTime() + 30 * 60000)
+
+    const isOcupado = appointments.some(app => {
+      return slotInicio < app.ends_at && slotFim > app.starts_at
+    })
+
+    if (isOcupado) {
+      slotsOcupados.push(slot)
+    } else {
+      slotsLivres.push(slot)
+    }
+  }
+
+  return { slots: slotsLivres, slotsOcupados }
 }
