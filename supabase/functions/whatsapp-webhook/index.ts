@@ -1039,6 +1039,30 @@ async function getBarbeiros(barbershopId: string, serviceId: string, diaDDMM: st
   return result
 }
 
+async function deletarConversa(clienteNumero: string): Promise<void> {
+  const t0 = Date.now()
+  const { error } = await supabase
+    .from("conversations_chatbot")
+    .delete()
+    .eq("client_phone_number_id", clienteNumero)
+    .eq("status", "em_andamento")
+  
+  registrarQuery({ 
+    tabela: 'conversations_chatbot', 
+    operacao: 'DELETE', 
+    filtros: `client_phone_number_id=...${clienteNumero.slice(-4)} status=em_andamento`, 
+    linhas: 1, 
+    duracaoMs: Date.now() - t0, 
+    cached: false 
+  })
+  
+  if (error) {
+    console.error("[ERRO] deletarConversa:", JSON.stringify(error))
+  } else {
+    console.log(`[DELETADO] Conversa do cliente ${clienteNumero.slice(-4)} removida`)
+  }
+}
+
 interface ServicoAgendado {
   servico: Servico
   barbeiro: Barbeiro
@@ -1568,6 +1592,7 @@ async function processarComBotoes(
 
         if (!resultado.success) {
           await enviarBotoesErroNoAgendamento(phoneNumberId, from)
+          await deletarConversa(from)
           estado.etapa = 'inicio'
           return
         }
@@ -1581,6 +1606,8 @@ async function processarComBotoes(
           `*Total: R$ ${totalValor.toFixed(2).replace('.', ',')}*\n` +
           `📅 ${estado.dia}\n\n` +
           `Te esperamos! 💈`
+
+        await deletarConversa(from)
 
         estado.etapa = 'inicio'
         estado.servicos = []
